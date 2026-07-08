@@ -340,6 +340,7 @@ class BookingPlaywrightCollector(BaseCollector):
                 "load_more_last_button_visible": False,
                 "load_more_last_button_enabled": False,
                 "load_more_cookie_banner_visible_before_click": False,
+                "load_more_bottom_scan_attempts": 0,
                 "hotel_cards_before_load_more": 0,
                 "hotel_cards_after_load_more": 0,
                 "hotel_cards_before_last_click": 0,
@@ -1593,6 +1594,15 @@ class BookingPlaywrightCollector(BaseCollector):
 
         found = self.find_load_more_button(page, log_callback)
         if found is None:
+            self.log(log_callback, "Load more was not immediately visible; scanning at the bottom of the page.")
+            found = self._scroll_to_bottom_until_load_more(
+                page,
+                selector,
+                options,
+                log_callback,
+                wait_after_scroll_ms=900,
+            )
+        if found is None:
             return False
 
         options.stats["load_more_button_found"] = True
@@ -1698,14 +1708,17 @@ class BookingPlaywrightCollector(BaseCollector):
         wait_seconds = 30 if not options or options.ultra_reliable_loading_mode else 24
         deadline = time.monotonic() + wait_seconds
         after_count = previous_card_count
+        logged_button_wait = False
         while time.monotonic() < deadline:
             page.wait_for_timeout(1000)
             after_count = self._best_hotel_card_count(page, selector, log_callback)
             if after_count > previous_card_count:
                 break
             if self.find_load_more_button(page, None) is None and after_count == previous_card_count:
-                self.log(log_callback, "Load more button disappeared and no new hotel cards appeared yet.")
-                break
+                if not logged_button_wait:
+                    self.log(log_callback, "Load more button disappeared; waiting for new hotel cards to render.")
+                    logged_button_wait = True
+                continue
 
         new_cards = max(after_count - previous_card_count, 0)
         self.log(log_callback, f"Hotel cards after Load more: {after_count}.")
@@ -1921,17 +1934,15 @@ class BookingPlaywrightCollector(BaseCollector):
             self._ensure_results_page(page, results_url, options, log_callback)
             height_before = self._safe_page_height(page)
 
-            self._scroll_last_loaded_card_into_view(page, selector)
-            page.mouse.wheel(0, 3000)
-            page.wait_for_timeout(1400 if options.ultra_reliable_loading_mode else 1000)
-            page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
-            page.wait_for_timeout(1400 if options.ultra_reliable_loading_mode else 1000)
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(2500 if options.ultra_reliable_loading_mode else 2000)
-
             before_update_count = len(unique_results_by_key)
+            found = self._scroll_to_bottom_until_load_more(
+                page,
+                selector,
+                options,
+                log_callback,
+                unique_hotels=unique_results_by_key,
+            )
             self._update_unique_hotels_from_page(page, selector, unique_results_by_key, options, log_callback)
-            found = self.find_load_more_button(page, log_callback)
             load_more_visible = found is not None
             options.stats["load_more_last_button_visible"] = bool(load_more_visible)
             if load_more_visible:
@@ -2038,6 +2049,64 @@ class BookingPlaywrightCollector(BaseCollector):
                 cards.nth(count - 1).scroll_into_view_if_needed(timeout=3000)
         except PlaywrightError:
             pass
+
+    def _scroll_to_bottom_until_load_more(
+        self,
+        page,
+        selector: str | None,
+        options: CollectorOptions | None,
+        log_callback: LogCallback | None,
+        *,
+        unique_hotels: dict[str, dict] | None = None,
+        wait_after_scroll_ms: int | None = None,
+    ):
+        options = options or CollectorOptions()
+        delay_ms = wait_after_scroll_ms or (1600 if options.ultra_reliable_loading_mode else 1000)
+        max_attempts = 8 if options.ultra_reliable_loading_mode else 5
+        stable_bottom_passes = 0
+        previous_height = self._safe_page_height(page)
+        self.log(log_callback, "Scanning downward for the bottom Load more results button.")
+
+        for attempt in range(1, max_attempts + 1):
+            options.stats["load_more_bottom_scan_attempts"] = int(options.stats.get("load_more_bottom_scan_attempts", 0)) + 1
+            try:
+                self._scroll_last_loaded_card_into_view(page, selector)
+                page.mouse.wheel(0, 5000)
+                page.wait_for_timeout(max(350, delay_ms // 2))
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(delay_ms)
+            except PlaywrightError as exc:
+                options.stats["last_load_more_error"] = str(exc)
+                self.log(log_callback, f"Bottom scan scroll failed: {exc}")
+                return None
+
+            if unique_hotels is not None:
+                self._update_unique_hotels_from_page(page, selector, unique_hotels, options, log_callback)
+
+            found = self.find_load_more_button(page, None)
+            current_height = self._safe_page_height(page)
+            current_scroll = self._safe_scroll_position(page)
+            self.log(
+                log_callback,
+                f"Bottom scan {attempt}/{max_attempts}: height={current_height}, scroll={current_scroll}, load_more={'yes' if found else 'no'}",
+            )
+            if found is not None:
+                text = found.get("text") or "<no visible text>"
+                self.log(log_callback, f"Bottom Load more button is ready: {text}")
+                return found
+
+            if current_height <= previous_height:
+                stable_bottom_passes += 1
+            else:
+                stable_bottom_passes = 0
+            previous_height = current_height
+
+            if stable_bottom_passes >= 2:
+                self.log(log_callback, "Bottom stayed stable and no Load more button appeared.")
+                return None
+
+        self.log(log_callback, "Bottom scan ended without finding another Load more button.")
+        return None
 
     def _bottom_visible_text(self, page) -> str:
         try:
@@ -2246,14 +2315,17 @@ class BookingPlaywrightCollector(BaseCollector):
                 raise RuntimeError("blocked_or_access_restricted: Booking.com showed CAPTCHA or access restriction wording during scrolling.")
 
             self._ensure_results_page(page, results_url, options, log_callback)
-            page.mouse.wheel(0, 1800)
-            page.wait_for_timeout(delay_ms)
-            page.evaluate("window.scrollBy(0, Math.floor(window.innerHeight * 0.85))")
-            page.wait_for_timeout(delay_ms)
             cycle_added_before_click = self._update_unique_hotels_from_page(page, selector, unique_hotels, options, log_callback)
 
             previous_count = current_count
-            found = self.find_load_more_button(page, log_callback)
+            found = self._scroll_to_bottom_until_load_more(
+                page,
+                selector,
+                options,
+                log_callback,
+                unique_hotels=unique_hotels,
+                wait_after_scroll_ms=delay_ms,
+            )
             if found is not None:
                 clicked_and_loaded = self.click_load_more_results(
                     page,
@@ -3141,6 +3213,7 @@ class BookingPlaywrightCollector(BaseCollector):
             "load_more_last_button_visible": bool(options.stats.get("load_more_last_button_visible")),
             "load_more_last_button_enabled": bool(options.stats.get("load_more_last_button_enabled")),
             "load_more_cookie_banner_visible_before_click": bool(options.stats.get("load_more_cookie_banner_visible_before_click")),
+            "load_more_bottom_scan_attempts": int(options.stats.get("load_more_bottom_scan_attempts", 0)),
             "hotel_cards_before_load_more": int(options.stats.get("hotel_cards_before_load_more", 0)),
             "hotel_cards_after_load_more": int(options.stats.get("hotel_cards_after_load_more", 0)),
             "hotel_cards_before_last_click": int(options.stats.get("hotel_cards_before_last_click", 0)),
