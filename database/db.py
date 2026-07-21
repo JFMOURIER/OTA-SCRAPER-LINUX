@@ -6,7 +6,7 @@ import sqlite3
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import psycopg
 from dotenv import load_dotenv
@@ -129,6 +129,84 @@ def fetch_results_by_run_id(run_id: int, backend: str | None = None) -> list[dic
     return _fetch_results_by_run_id_sqlite(run_id)
 
 
+def fetch_results_by_run_id_limited(run_id: int, limit: int = 500, backend: str | None = None) -> list[dict[str, Any]]:
+    if normalize_backend(backend) == "postgres":
+        rows = _fetch_results_by_run_id_postgres(run_id)
+        return rows[-max(1, int(limit)) :]
+    with _sqlite_connection() as conn:
+        rows = conn.execute(
+            """
+            select * from hotel_price_results
+            where collection_run_id = ?
+            order by id desc
+            limit ?
+            """,
+            (run_id, max(1, int(limit))),
+        ).fetchall()
+        return list(reversed(_sqlite_rows_to_dicts(rows)))
+
+
+def count_results_by_run_id(run_id: int, backend: str | None = None) -> int:
+    if normalize_backend(backend) == "postgres":
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("select count(*) from hotel_price_results where collection_run_id = %s", (run_id,))
+                return int(cur.fetchone()[0])
+    with _sqlite_connection() as conn:
+        return int(conn.execute("select count(*) from hotel_price_results where collection_run_id = ?", (run_id,)).fetchone()[0])
+
+
+def result_date_counts_by_run_id(run_id: int, backend: str | None = None) -> dict[str, int]:
+    if normalize_backend(backend) == "postgres":
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select checkin_date, count(*) from hotel_price_results where collection_run_id = %s group by checkin_date",
+                    (run_id,),
+                )
+                return {str(row[0]): int(row[1]) for row in cur.fetchall() if row[0] is not None}
+    with _sqlite_connection() as conn:
+        rows = conn.execute(
+            "select checkin_date, count(*) from hotel_price_results where collection_run_id = ? group by checkin_date",
+            (run_id,),
+        ).fetchall()
+        return {str(row[0]): int(row[1]) for row in rows if row[0] is not None}
+
+
+def iter_sqlite_results_by_run_id(run_id: int, batch_size: int = 500) -> Iterator[list[dict[str, Any]]]:
+    """Yield bounded SQLite batches without retaining the complete run."""
+
+    conn = _sqlite_connection()
+    try:
+        cursor = conn.execute(
+            """
+            select * from hotel_price_results
+            where collection_run_id = ?
+            order by checkin_date, ranking_position_on_page, id
+            """,
+            (run_id,),
+        )
+        while True:
+            rows = cursor.fetchmany(max(1, int(batch_size)))
+            if not rows:
+                break
+            yield _sqlite_rows_to_dicts(rows)
+    finally:
+        conn.close()
+
+
+def sqlite_integrity_check() -> str:
+    with _sqlite_connection() as conn:
+        return str(conn.execute("pragma integrity_check").fetchone()[0])
+
+
+def sqlite_wal_checkpoint(mode: str = "PASSIVE") -> tuple[int, int, int]:
+    safe_mode = mode.upper() if mode.upper() in {"PASSIVE", "FULL", "RESTART"} else "PASSIVE"
+    with _sqlite_connection() as conn:
+        row = conn.execute(f"pragma wal_checkpoint({safe_mode})").fetchone()
+        return int(row[0]), int(row[1]), int(row[2])
+
+
 def fetch_collection_runs(limit: int = 20, backend: str | None = None) -> list[dict[str, Any]]:
     if normalize_backend(backend) == "postgres":
         return _fetch_collection_runs_postgres(limit)
@@ -157,6 +235,9 @@ def _sqlite_connection() -> sqlite3.Connection:
     SQLITE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(SQLITE_DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("pragma journal_mode=WAL")
+    conn.execute("pragma synchronous=NORMAL")
+    conn.execute("pragma busy_timeout=30000")
     return conn
 
 
@@ -291,6 +372,9 @@ def _terminal_completed_at(status: str) -> datetime | None:
         "failed",
         "blocked_or_access_restricted",
         "stopped_by_user",
+        "stopped_resource_limit",
+        "browser_crash",
+        "application_exception",
     }
     return datetime.now() if status in terminal_statuses else None
 

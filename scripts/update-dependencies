@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJECT_DIR"
+[[ -x .venv/bin/python ]] || { echo "Run scripts/setup-linux first." >&2; exit 1; }
+.venv/bin/python -m pip install --upgrade -r requirements.txt
+.venv/bin/python -m playwright install chromium
+echo "Dependencies and the project Chromium browser were updated."

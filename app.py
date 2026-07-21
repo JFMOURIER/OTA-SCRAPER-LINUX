@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+import gc
 import json
+import multiprocessing
 import sys
 import time
 import traceback
@@ -34,13 +36,17 @@ from collectors.serpapi_google_hotels import SerpApiGoogleHotelsCollector
 from database.db import (
     SQLITE_DB_PATH,
     create_collection_run,
+    count_results_by_run_id,
     fetch_collection_runs,
     fetch_latest_results,
     fetch_results_by_run_id,
+    fetch_results_by_run_id_limited,
     get_connection,
     init_db,
     insert_hotel_results,
+    result_date_counts_by_run_id,
     reset_sqlite_database,
+    sqlite_wal_checkpoint,
     update_collection_run_excel_path,
     update_collection_run_status,
 )
@@ -51,10 +57,14 @@ from services.exporter import (
     create_summary,
     export_batch_master_excel,
     export_results_to_excel,
+    export_results_to_csv,
+    export_sqlite_run_to_csv,
+    export_sqlite_run_to_excel,
     safe_filename,
 )
 from services.instance_config import INSTANCE_CONFIG
 from services.job_runner import (
+    CancellationSignal,
     RetrySettings,
     atomic_write_json,
     build_checkpoint,
@@ -67,6 +77,14 @@ from services.job_runner import (
     update_heartbeat,
 )
 from services.normalizer import normalize_hotel_result
+from services.playwright_safe import launch_managed_chromium_context, safe_close_browser, safe_screenshot
+from services.resource_guard import (
+    ResourceGuard,
+    ResourceLimitExceeded,
+    ScraperAlreadyRunning,
+    SingleScraperLock,
+    cleanup_owned_browser_processes,
+)
 from services.scraper_errors import (
     AccessRestrictionError,
     BrowserClosedError,
@@ -86,12 +104,15 @@ BROWSER_PROFILE_DIR = INSTANCE_CONFIG.browser_profile_dir
 CHECKPOINT_DIR = INSTANCE_CONFIG.checkpoint_dir
 STATUS_DIR = INSTANCE_CONFIG.status_dir
 STATUS_FILE = INSTANCE_CONFIG.status_file
-PARTIAL_DIR = INSTANCE_CONFIG.data_dir / "partial"
+PARTIAL_DIR = INSTANCE_CONFIG.partial_dir
 HEARTBEAT_FILE = STATUS_DIR / "heartbeat.json"
 ENV_PATH = BASE_DIR / ".env"
-EXECUTOR = ThreadPoolExecutor(max_workers=1)
 SQLITE_WRITE_LOCK = Lock()
 ACTIVE_STATUS_STALE_AFTER_SECONDS = 120
+SCRAPER_LOCK_FILE = BASE_DIR / "data" / "active_scraper.lock"
+CANCEL_FILE = STATUS_DIR / "cancel_request.json"
+WORKER_STOP_GRACE_SECONDS = 8.0
+MAX_UI_RESULTS = 500
 
 
 st.set_page_config(page_title="Hotel Price Collector", page_icon=":hotel:", layout="wide")
@@ -145,8 +166,8 @@ class CollectionConfig:
     retry_failed_dates_automatically: bool = True
     max_retries_per_date: int = 3
     continue_if_date_fails: bool = True
-    auto_export_partial_excel: bool = True
-    partial_export_frequency: str = "every_date"
+    auto_export_partial_excel: bool = False
+    partial_export_frequency: str = "every_25_dates"
 
 
 @dataclass(slots=True)
@@ -170,6 +191,10 @@ def ensure_session_state() -> None:
         "progress": 0.0,
         "run_id": None,
         "excel_file_path": None,
+        "csv_file_path": None,
+        "csv_export_status": None,
+        "csv_export_error": None,
+        "csv_rows_exported": 0,
         "records_saved": 0,
         "db_ready": False,
         "db_error": None,
@@ -351,7 +376,7 @@ def render_setup_diagnostics(diagnostics: dict[str, Any]) -> None:
     st.subheader("Setup Diagnostics")
     st.caption("Expected .env path")
     st.code(str(diagnostics["expected_env_path"]), language="text")
-    st.dataframe(pd.DataFrame(diagnostics["rows"]), use_container_width=True, hide_index=True)
+    st.dataframe(text_rows_dataframe(diagnostics["rows"]), use_container_width=True, hide_index=True)
 
     if st.button("Test PostgreSQL connection"):
         try:
@@ -605,6 +630,7 @@ def build_startup_check() -> dict[str, Any]:
         "screenshot_dir": str(SCREENSHOT_DIR.resolve()),
         "debug_dir": str(DEBUG_DIR.resolve()),
         "status_dir": str(STATUS_DIR.resolve()),
+        "partial_dir": str(PARTIAL_DIR.resolve()),
         "current_process_id": os.getpid(),
         "python_executable": sys.executable,
         "working_directory": str(Path.cwd().resolve()),
@@ -634,16 +660,25 @@ def run_headless_smoke_test() -> dict[str, Any]:
         "final_url": None,
         "error_message": None,
     }
+    browser = context = page = None
     try:
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
-            page = browser.new_page(viewport={"width": 1366, "height": 900})
+            profile_dir = BROWSER_PROFILE_DIR / "diagnostics" / f"headless_smoke_{uuid4().hex}"
+            browser, context, implementation = launch_managed_chromium_context(
+                playwright,
+                headless=True,
+                profile_dir=profile_dir,
+                args=["--disable-dev-shm-usage"],
+                viewport={"width": 1366, "height": 900},
+            )
+            payload["browser_implementation"] = implementation
+            payload["profile_dir"] = str(profile_dir.resolve())
+            page = context.new_page()
             page.goto("https://www.booking.com", wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(2000)
             payload["page_title"] = page.title()
             payload["final_url"] = page.url
-            page.screenshot(path=str(screenshot_path), full_page=True)
-            browser.close()
+            safe_screenshot(page, screenshot_path, "headless smoke", full_page=False)
         payload["status"] = "completed"
     except Exception as exc:
         payload["status"] = "failed"
@@ -651,6 +686,8 @@ def run_headless_smoke_test() -> dict[str, Any]:
             f"{exc}\n\nPlaywright Chromium may not be installed. Run: python -m playwright install --with-deps chromium\n"
             f"Streamlit Python executable: {sys.executable}"
         )
+    finally:
+        safe_close_browser(browser=browser, context=context, page=page)
     write_json_file(DEBUG_DIR / "headless_smoke_test_latest.json", payload)
     return payload
 
@@ -705,7 +742,7 @@ def reset_period_1_running_state() -> None:
             st.warning(f"Could not clear {path}: {exc}")
     st.session_state.current_job = None
     st.session_state.status = "ready"
-    st.session_state.status_message = "Period 1 running state reset. Scraped data, exports, checkpoints, logs, and debug files were not deleted."
+    st.session_state.status_message = "Instance running state reset. Scraped data, exports, checkpoints, logs, and debug files were not deleted."
     st.session_state.progress = 0.0
     st.session_state.metrics = {}
 
@@ -860,13 +897,14 @@ def run_start_preflight(config: CollectionConfig) -> dict[str, Any]:
         add(name, path.exists() and path.is_dir(), str(path.resolve()))
 
     try:
-        require_dir("Period 1 data folder exists", INSTANCE_CONFIG.data_dir)
+        require_dir("Instance data folder exists", INSTANCE_CONFIG.data_dir)
         add("SQLite database path is valid", SQLITE_DB_PATH.parent.exists(), str(SQLITE_DB_PATH.resolve()))
         require_dir("logs folder exists", LOG_DIR)
         require_dir("status folder exists", STATUS_DIR)
         require_dir("checkpoints folder exists", CHECKPOINT_DIR)
         require_dir("exports folder exists", EXPORT_DIR)
         require_dir("browser_profile folder exists", BROWSER_PROFILE_DIR)
+        require_dir("partial folder exists", PARTIAL_DIR)
         options = CollectorOptions(**collector_options_kwargs(config, Event(), attempt=1))
         add("CollectorOptions can be instantiated", isinstance(options, CollectorOptions), "CollectorOptions OK")
         chromium_ok, chromium_detail = _preflight_check_playwright_chromium()
@@ -883,7 +921,7 @@ def run_start_preflight(config: CollectionConfig) -> dict[str, Any]:
         "checks": checks,
         "first_failed_check": failed[0] if failed else None,
     }
-    write_json_file(DEBUG_DIR / "period_1_preflight_latest.json", payload)
+    write_json_file(DEBUG_DIR / "instance_preflight_latest.json", payload)
     if failed:
         message = f"Preflight failed: {failed[0]['check']} - {failed[0]['detail']}"
         write_json_file(
@@ -908,13 +946,51 @@ def run_start_preflight(config: CollectionConfig) -> dict[str, Any]:
     return payload
 
 
-def run_background_job_with_fatal_guard(runner, config: CollectionConfig, stop_event: Event, queue: Queue) -> None:
-    job_id = getattr(queue, "job_id", None)
-    log_file = getattr(queue, "instance_log_file", None)
+def run_background_job_with_fatal_guard(
+    runner,
+    config: CollectionConfig,
+    stop_event: Any,
+    queue: Any,
+    job_id: str,
+    log_file: str,
+) -> None:
+    queue.job_id = job_id
+    queue.instance_log_file = log_file
     current_step = "background_job_start"
+    lock = SingleScraperLock(SCRAPER_LOCK_FILE)
+
+    def cleanup_log(message: str) -> None:
+        put_log(queue, message)
+
     try:
+        lock.acquire(job_id)
+        guard = ResourceGuard(INSTANCE_CONFIG.data_dir, owner_pid=os.getpid())
+        queue.resource_guard = guard
+        initial = guard.check(starting=True, force=True)
         update_status_file(job_id=job_id, status="running", current_step=current_step, log_file=log_file)
+        put_metrics(queue, {**initial.as_dict(), "resource_guard_level": guard.last_level})
         runner(config, stop_event, queue)
+    except ScraperAlreadyRunning as exc:
+        record_fatal_error(
+            exc=exc,
+            job_id=job_id,
+            status="refused_second_scraper",
+            current_step=current_step,
+            current_date=None,
+            log_file=log_file,
+            queue=queue,
+        )
+    except ResourceLimitExceeded as exc:
+        update_status_file(
+            job_id=job_id,
+            status="stopped_resource_limit",
+            current_step=current_step,
+            current_message=str(exc),
+            last_error=str(exc),
+            **exc.snapshot.as_dict(),
+        )
+        put_metrics(queue, {**exc.snapshot.as_dict(), "resource_guard_level": "emergency"})
+        queue.put(("failed", {"status": "stopped_resource_limit", "error": str(exc)}))
     except Exception as exc:
         status = "fatal_startup_error"
         record_fatal_error(
@@ -926,23 +1002,25 @@ def run_background_job_with_fatal_guard(runner, config: CollectionConfig, stop_e
             log_file=log_file,
             queue=queue,
         )
+    finally:
+        cleanup_owned_browser_processes(os.getpid(), cleanup_log)
+        lock.release()
 
 
 def build_resume_preview(config: CollectionConfig) -> dict[str, Any]:
     planned_dates = date_range(config.checkin_start, config.checkin_end)
     checkpoint = load_checkpoint(_checkpoint_path(config), _checkpoint_signature(config)) or {}
-    saved_rows: list[dict[str, Any]] = []
+    db_counts: dict[str, int] = {}
     run_id = checkpoint.get("run_id")
     try:
         if run_id:
-            saved_rows = fetch_results_by_run_id(int(run_id), backend=config.db_backend)
+            db_counts = result_date_counts_by_run_id(int(run_id), backend=config.db_backend)
         else:
             matched_run_id = matching_saved_run_id(config)
             if matched_run_id is not None:
-                saved_rows = fetch_results_by_run_id(matched_run_id, backend=config.db_backend)
+                db_counts = result_date_counts_by_run_id(matched_run_id, backend=config.db_backend)
     except Exception:
-        saved_rows = []
-    db_counts = saved_date_counts(saved_rows)
+        db_counts = {}
     completed = completed_dates_from_checkpoint_and_db(checkpoint, db_counts) if checkpoint else set(db_counts)
     remaining = [value for value in planned_dates if value.isoformat() not in completed]
     return {
@@ -950,7 +1028,7 @@ def build_resume_preview(config: CollectionConfig) -> dict[str, Any]:
         "Already completed dates": len(completed),
         "Remaining dates": len(remaining),
         "First remaining date": remaining[0].isoformat() if remaining else "none",
-        "Existing saved rows": len(saved_rows),
+        "Existing saved rows": sum(db_counts.values()),
     }
 
 
@@ -991,6 +1069,83 @@ def write_price_pipeline_debug(stay_date: date, results: list[dict[str, Any]]) -
     path = DEBUG_DIR / f"price_pipeline_debug_{stay_date.isoformat()}.json"
     write_json_file(path, {"stay_date": stay_date.isoformat(), "rows": rows, "summary": price_validation_summary(results)})
     return path.resolve()
+
+
+def export_final_csv(
+    results: list[dict[str, Any]],
+    summary: dict[str, Any],
+    *,
+    session_id: Any,
+    log_callback: Any = None,
+    stream_sqlite_run_id: int | None = None,
+) -> dict[str, Any]:
+    summary["scrape_session_id"] = session_id
+    summary["instance_id"] = INSTANCE_CONFIG.instance_id
+    row_count = count_results_by_run_id(stream_sqlite_run_id, backend="sqlite") if stream_sqlite_run_id is not None else len(results)
+    try:
+        if stream_sqlite_run_id is not None:
+            csv_path = export_sqlite_run_to_csv(
+                stream_sqlite_run_id,
+                summary,
+                EXPORT_DIR,
+                instance_id=INSTANCE_CONFIG.instance_id,
+            )
+        else:
+            csv_path = export_results_to_csv(
+                results,
+                summary,
+                EXPORT_DIR,
+                instance_id=INSTANCE_CONFIG.instance_id,
+                session_id=session_id,
+            )
+        payload = {
+            "csv_file_path": str(csv_path),
+            "csv_export_status": "succeeded",
+            "csv_export_error": None,
+            "csv_export_traceback_file": None,
+            "csv_rows_exported": row_count,
+        }
+        summary["final CSV export path"] = str(csv_path)
+        summary["final CSV export status"] = "succeeded"
+        summary["final CSV rows exported"] = row_count
+        if log_callback:
+            log_callback(f"Final CSV exported atomically: {csv_path}")
+    except Exception as exc:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        traceback_file = LOG_DIR / f"csv_export_error_{timestamp}.txt"
+        traceback_file.write_text(
+            "\n".join(
+                [
+                    f"timestamp: {datetime.now().isoformat(sep=' ', timespec='seconds')}",
+                    f"instance_id: {INSTANCE_CONFIG.instance_id}",
+                    f"session_id: {session_id}",
+                    f"error: {exc}",
+                    "",
+                    traceback.format_exc(),
+                ]
+            ),
+            encoding="utf-8",
+        )
+        payload = {
+            "csv_file_path": None,
+            "csv_export_status": "failed",
+            "csv_export_error": str(exc),
+            "csv_export_traceback_file": str(traceback_file.resolve()),
+            "csv_rows_exported": row_count,
+        }
+        summary["final CSV export path"] = None
+        summary["final CSV export status"] = "failed"
+        summary["final CSV export error"] = str(exc)
+        summary["final CSV export traceback file"] = str(traceback_file.resolve())
+        summary["final CSV rows exported"] = row_count
+        if log_callback:
+            log_callback(f"Final CSV export failed: {exc}. Traceback: {traceback_file.resolve()}")
+    try:
+        update_status_file(**payload)
+    except Exception:
+        pass
+    return payload
 
 
 def build_batch_blocks(start_date: date, end_date: date, batch_mode: str, custom_block_days: int = 1) -> list[BatchBlock]:
@@ -1084,6 +1239,10 @@ def display_path(path: Path) -> str:
         return str(path.resolve())
 
 
+def text_rows_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    return pd.DataFrame([{key: "" if value is None else str(value) for key, value in row.items()} for row in rows])
+
+
 def render_instance_info() -> None:
     st.subheader("Instance")
     cols = st.columns(4)
@@ -1100,6 +1259,7 @@ def render_instance_info() -> None:
         {"Item": "Debug folder", "Value": str(DEBUG_DIR.resolve())},
         {"Item": "Log folder", "Value": str(LOG_DIR.resolve())},
         {"Item": "Browser profile folder", "Value": str(BROWSER_PROFILE_DIR.resolve())},
+        {"Item": "Partial folder", "Value": str(PARTIAL_DIR.resolve())},
         {"Item": "Status folder", "Value": str(STATUS_DIR.resolve())},
         {"Item": "Status file", "Value": str(STATUS_FILE.resolve())},
         {"Item": "Startup check file", "Value": str((DEBUG_DIR / "instance_startup_check.json").resolve())},
@@ -1113,14 +1273,14 @@ def render_instance_info() -> None:
         },
         {"Item": "Active log file", "Value": st.session_state.active_log_file_path or "No active run log yet"},
     ]
-    st.dataframe(pd.DataFrame(info_rows), use_container_width=True, hide_index=True)
+    st.dataframe(text_rows_dataframe(info_rows), use_container_width=True, hide_index=True)
     st.warning(
-        "Recommended: start with 2 simultaneous instances. Advanced: 3 or 4 instances may work if the PC has enough RAM and CPU. "
-        "Too many simultaneous Booking.com sessions may slow down the PC, reduce reliability, or cause pages not to load."
+        "This 8 GB tower is limited to one scraper worker and one scraper browser. "
+        "A second scraper is refused by the host-wide safety lock."
     )
 
 
-def render_period_1_error_panel() -> None:
+def render_instance_error_panel() -> None:
     status = maybe_mark_stale_status_file(read_current_status_file())
     last_error = read_last_error()
     heartbeat = read_json_path(HEARTBEAT_FILE)
@@ -1141,7 +1301,7 @@ def render_period_1_error_panel() -> None:
         if traceback_file:
             st.code(str(traceback_file), language="text")
 
-    with st.expander("Period 1 job health", expanded=True):
+    with st.expander("Instance job health", expanded=True):
         rows = [
             {"Item": "Current job status", "Value": current_status or "unknown"},
             {"Item": "Is job running", "Value": "yes" if is_running else "no"},
@@ -1150,7 +1310,7 @@ def render_period_1_error_panel() -> None:
             {"Item": "Last traceback file", "Value": str(traceback_file or "-")},
             {"Item": "Current step", "Value": status.get("current_step") or last_error.get("current_step") or "-"},
         ]
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(text_rows_dataframe(rows), use_container_width=True, hide_index=True)
         if last_error:
             st.caption(str((STATUS_DIR / "last_error.json").resolve()))
             st.json(last_error)
@@ -1165,6 +1325,10 @@ def reset_current_results() -> None:
     st.session_state.progress = 0.0
     st.session_state.run_id = None
     st.session_state.excel_file_path = None
+    st.session_state.csv_file_path = None
+    st.session_state.csv_export_status = None
+    st.session_state.csv_export_error = None
+    st.session_state.csv_rows_exported = 0
     st.session_state.records_saved = 0
     st.session_state.metrics = {}
     st.session_state.current_job = None
@@ -1344,13 +1508,17 @@ def collector_options_kwargs(config: CollectionConfig, stop_event: Event | None 
         "exports_dir": EXPORT_DIR,
         "log_dir": LOG_DIR,
         "instance_data_dir": INSTANCE_CONFIG.data_dir,
-        "browser_profile_dir": (BROWSER_PROFILE_DIR / "browser_profile_headless") if config.headless and is_booking_source(config.source) else BROWSER_PROFILE_DIR,
+        "browser_profile_dir": BROWSER_PROFILE_DIR / "jobs" / f"worker_{os.getpid()}" / ("headless" if config.headless else "visible"),
         "partial_dir": PARTIAL_DIR,
         "current_attempt": attempt,
     }
 
 
 def validate_collector_options(config: CollectionConfig, stop_event: Event | None = None) -> None:
+    if config.batch_mode != "single" or int(config.max_parallel_workers) != 1:
+        raise FatalScraperConfigError(
+            "Parallel or split batch workers are disabled on this 8 GB tower. Use Single run; it checkpoints every date."
+        )
     try:
         CollectorOptions(**collector_options_kwargs(config, stop_event, attempt=1))
     except TypeError as exc:
@@ -1703,6 +1871,7 @@ def run_collection_job(config: CollectionConfig, stop_event: Event, queue: Queue
         excel_path = export_results_to_excel(normalized_results, summary, EXPORT_DIR)
         options.stats["excel_export_time_seconds"] = round(time.perf_counter() - excel_start, 2)
         update_collection_run_excel_path(run_id, str(excel_path), backend=config.db_backend)
+        csv_payload = export_final_csv(normalized_results, summary, session_id=run_id, log_callback=log)
 
         status = terminal_status_for_results(normalized_results, stop_event.is_set(), None)
         if str(options.stats.get("completion_status") or "").startswith("incomplete") and normalized_results:
@@ -1719,8 +1888,8 @@ def run_collection_job(config: CollectionConfig, stop_event: Event, queue: Queue
             options.stats["resume_checkpoint_path"] = str(checkpoint_path.resolve())
         log(f"Database run status updated: {status}")
 
-        queue.put(("complete", {"results": normalized_results, "summary": summary, "excel_file_path": str(excel_path), "status": status}))
-        update_status_file(status=status, progress_percent=100.0, current_message=f"Collection finished: {status}", latest_excel_file=str(excel_path), **price_validation_summary(normalized_results))
+        queue.put(("complete", {"results": normalized_results, "summary": summary, "excel_file_path": str(excel_path), "status": status, **csv_payload}))
+        update_status_file(status=status, progress_percent=100.0, current_message=f"Collection finished: {status}", latest_excel_file=str(excel_path), **csv_payload, **price_validation_summary(normalized_results))
         put_metrics(queue, {
             **(options.stats or {}),
             "hotels_collected_per_minute": round(len(normalized_results) / max((datetime.now() - started_at).total_seconds() / 60, 0.01), 2),
@@ -1823,14 +1992,15 @@ def run_collection_job(config: CollectionConfig, stop_event: Event, queue: Queue
                 summary = create_summary(normalized_results, run_metadata)
                 excel_path = export_results_to_excel(normalized_results, summary, EXPORT_DIR)
                 update_collection_run_excel_path(run_id, str(excel_path), backend=config.db_backend)
-                queue.put(("complete", {"results": normalized_results, "summary": summary, "excel_file_path": str(excel_path), "status": status}))
+                csv_payload = export_final_csv(normalized_results, summary, session_id=run_id, log_callback=log)
+                queue.put(("complete", {"results": normalized_results, "summary": summary, "excel_file_path": str(excel_path), "status": status, **csv_payload}))
             update_collection_run_status(run_id, status, error_message, backend=config.db_backend)
             log(f"Database run status updated: {status}")
-        queue.put(("failed", {"status": status, "error": error_message}))
+        queue.put(("failed", {"status": status, "error": error_message, **(locals().get("csv_payload") or {})}))
         progress(1.0, f"Collection finished: {status}")
 
 
-def run_resilient_collection_job(config: CollectionConfig, stop_event: Event, queue: Queue) -> None:
+def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queue: Any) -> None:
     started_at = datetime.now()
     perf_start = time.perf_counter()
     planned_dates = date_range(config.checkin_start, config.checkin_end)
@@ -1851,6 +2021,7 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Event, qu
     last_snapshot_time = time.monotonic()
     fatal_error: str | None = None
     run_id: int | None = None
+    guard: ResourceGuard = getattr(queue, "resource_guard", ResourceGuard(INSTANCE_CONFIG.data_dir, owner_pid=os.getpid()))
     checkpoint_path = _checkpoint_path(config)
     current_checkpoint_path = CHECKPOINT_DIR / "current_run_resume.json"
 
@@ -1883,12 +2054,34 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Event, qu
         )
 
     def progress(value: float, message: str) -> None:
+        snapshot = guard.check()
         put_progress(queue, value, message)
+        put_metrics(queue, {**snapshot.as_dict(), "resource_guard_level": guard.last_level})
         update_status_file(
             progress_percent=round(value * 100, 2),
             current_message=message,
             elapsed_seconds=round(time.perf_counter() - perf_start, 2),
+            **snapshot.as_dict(),
         )
+
+    def retain_recent(records: list[dict[str, Any]]) -> None:
+        combined = normalized_results + records
+        deduped_reversed: list[dict[str, Any]] = []
+        seen: set[tuple[Any, ...]] = set()
+        for row in reversed(combined):
+            key = (
+                row.get("collection_run_id"),
+                str(row.get("source") or "").lower(),
+                str(row.get("checkin_date") or ""),
+                str(row.get("hotel_url") or row.get("hotel_name") or "").lower(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped_reversed.append(row)
+            if len(deduped_reversed) >= MAX_UI_RESULTS:
+                break
+        normalized_results[:] = list(reversed(deduped_reversed))
 
     def save_checkpoint(payload: dict[str, Any]) -> None:
         atomic_write_json(checkpoint_path, payload)
@@ -1919,6 +2112,8 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Event, qu
             "__date_status_rows": date_status_rows,
         }
         summary = create_summary(normalized_results, run_metadata)
+        summary["total_records"] = saved_count
+        summary["results retained in worker memory"] = len(normalized_results)
         summary["__date_status_rows"] = date_status_rows
         summary.update(price_validation_summary(normalized_results))
         return summary
@@ -1934,21 +2129,73 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Event, qu
             output_dir = snapshot_dir
         else:
             output_dir = EXPORT_DIR
-        excel_path = export_results_to_excel(normalized_results, summary, output_dir, filename=filename)
+        if config.db_backend == "sqlite" and run_id is not None:
+            excel_path = export_sqlite_run_to_excel(run_id, summary, output_dir, filename=filename)
+        else:
+            excel_path = export_results_to_excel(normalized_results, summary, output_dir, filename=filename)
         log(f"Partial Excel exported: {excel_path}")
         return excel_path
 
     def make_options(attempt: int) -> CollectorOptions:
+        nonlocal saved_count
         options = CollectorOptions(**collector_options_kwargs(config, stop_event, attempt=attempt))
+        partial_seen_keys: set[str] = set()
+        job_token = safe_filename(str(getattr(queue, "job_id", None) or f"worker_{os.getpid()}"))
+        mode_token = "headless" if config.headless else "visible"
+        options.browser_profile_dir = BROWSER_PROFILE_DIR / "jobs" / job_token / mode_token
+        options.screenshot_dir = SCREENSHOT_DIR / "runs" / job_token
+        options.screenshots_dir = options.screenshot_dir
+        options.stats["screenshot_limit"] = max(1, int(os.getenv("OTA_SCREENSHOT_LIMIT_PER_DATE", "12")))
 
         def collector_status_callback(updates: dict[str, Any]) -> None:
-            update_status_file(**updates)
-            put_metrics(queue, {**(options.stats or {}), **updates})
+            snapshot = guard.check()
+            telemetry = {**snapshot.as_dict(), "resource_guard_level": guard.last_level}
+            update_status_file(**updates, **telemetry)
+            put_metrics(queue, {**(options.stats or {}), **updates, **telemetry})
 
         def partial_results_callback(stay_date: date, records: list[dict[str, Any]], metadata: dict[str, Any]) -> None:
             if not records:
                 return
             paths = save_partial_records(PARTIAL_DIR, stay_date, records)
+            if run_id is not None:
+                persistable: list[dict[str, Any]] = []
+                checkout_date = calculate_checkout_date(stay_date, config.nights)
+                for index, record in enumerate(records, start=1):
+                    identity = str(record.get("url") or record.get("hotel_url") or record.get("name") or record.get("hotel_name") or "").strip().lower()
+                    if not identity or identity in partial_seen_keys:
+                        continue
+                    partial_seen_keys.add(identity)
+                    persistable.append(
+                        normalize_hotel_result(
+                            {
+                                "collection_run_id": run_id,
+                                "source": config.source,
+                                "city_or_region": config.city_or_region,
+                                "search_url": record.get("search_url"),
+                                "hotel_name": record.get("name") or record.get("hotel_name"),
+                                "hotel_url": record.get("url") or record.get("hotel_url"),
+                                "raw_price_text": record.get("price") or record.get("raw_price_text"),
+                                "parsed_price": record.get("price") or record.get("parsed_price"),
+                                "cheapest_price_total": record.get("price") or record.get("cheapest_price_total"),
+                                "currency": config.currency,
+                                "checkin_date": stay_date,
+                                "checkout_date": checkout_date,
+                                "number_of_nights": config.nights,
+                                "adults": config.adults,
+                                "provider_name": config.source,
+                                "ranking_position_on_page": record.get("index") or index,
+                                "collection_status": "partial",
+                                "collected_at": datetime.now(),
+                            }
+                        )
+                    )
+                if persistable:
+                    with _db_write_lock_for(config):
+                        insert_hotel_results(persistable, backend=config.db_backend)
+                    saved_count = count_results_by_run_id(run_id, backend=config.db_backend)
+                    retain_recent(persistable)
+                    queue.put(("records_saved", saved_count))
+                    log(f"Incremental SQLite checkpoint: {len(persistable)} newly discovered hotels for {stay_date.isoformat()}.")
             options.stats["partial_json_path"] = paths["json"]
             options.stats["partial_csv_path"] = paths["csv"]
             options.stats["partial_records_saved"] = paths["records"]
@@ -1983,15 +2230,16 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Event, qu
             log(f"Saving {len(date_results)} records for {stay_date.isoformat()} to {config.db_backend}.")
             db_save_start = time.perf_counter()
             with _db_write_lock_for(config):
-                saved_count += insert_hotel_results(date_results, backend=config.db_backend)
+                insert_hotel_results(date_results, backend=config.db_backend)
+            saved_count = count_results_by_run_id(run_id_value, backend=config.db_backend)
             options.stats["database_save_time_seconds"] = round(float(options.stats.get("database_save_time_seconds", 0)) + (time.perf_counter() - db_save_start), 2)
             queue.put(("records_saved", saved_count))
-        normalized_results.extend(date_results)
+        retain_recent(date_results)
         price_debug_path = write_price_pipeline_debug(stay_date, date_results)
         price_summary = price_validation_summary(date_results)
         update_status_file(
             hotels_collected_current_date=len(date_results),
-            hotels_collected_total=len(normalized_results),
+            hotels_collected_total=saved_count,
             rows_with_raw_price=price_summary.get("rows_with_raw_price"),
             rows_with_parsed_price=price_summary.get("rows_with_parsed_price"),
             rows_missing_price=price_summary.get("rows_missing_price"),
@@ -2005,6 +2253,7 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Event, qu
 
     try:
         progress(0.01, "Preparing resilient collection run")
+        init_db(config.db_backend)
         update_status_file(
             job_id=getattr(queue, "job_id", None),
             status="running",
@@ -2022,16 +2271,16 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Event, qu
         if checkpoint and checkpoint.get("run_id"):
             run_id = int(checkpoint["run_id"])
             update_collection_run_status(run_id, "running", None, backend=config.db_backend)
-            normalized_results = fetch_results_by_run_id(run_id, backend=config.db_backend)
-            saved_count = len(normalized_results)
+            normalized_results = fetch_results_by_run_id_limited(run_id, MAX_UI_RESULTS, backend=config.db_backend)
+            saved_count = count_results_by_run_id(run_id, backend=config.db_backend)
             log(f"Resuming previous run {run_id}. Existing saved rows: {saved_count}.")
         elif retry_settings.resume_from_checkpoint:
             matched_run_id = matching_saved_run_id(config)
             if matched_run_id is not None:
                 run_id = matched_run_id
                 update_collection_run_status(run_id, "running", None, backend=config.db_backend)
-                normalized_results = fetch_results_by_run_id(run_id, backend=config.db_backend)
-                saved_count = len(normalized_results)
+                normalized_results = fetch_results_by_run_id_limited(run_id, MAX_UI_RESULTS, backend=config.db_backend)
+                saved_count = count_results_by_run_id(run_id, backend=config.db_backend)
                 checkpoint = build_checkpoint(
                     job_id=getattr(queue, "job_id", None),
                     run_id=run_id,
@@ -2075,7 +2324,7 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Event, qu
             log(f"New run created: {run_id}")
         queue.put(("run_id", run_id))
         queue.put(("records_saved", saved_count))
-        db_date_counts = saved_date_counts(normalized_results)
+        db_date_counts = result_date_counts_by_run_id(run_id, backend=config.db_backend)
         completed_dates = completed_dates_from_checkpoint_and_db(checkpoint, db_date_counts)
         checkpoint["completed_dates"] = sorted(completed_dates)
         for completed_date in sorted(completed_dates):
@@ -2191,8 +2440,7 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Event, qu
                         run_id_value=run_id,
                         options=options,
                     )
-                    partial_excel = export_partial("running") if retry_settings.auto_export_partial_excel else None
-                    output_files["partial_excel"] = str(partial_excel) if partial_excel else None
+                    output_files["partial_excel"] = None
                     checkpoint = update_checkpoint_date(
                         checkpoint,
                         stay_date=stay_date,
@@ -2208,12 +2456,63 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Event, qu
                     completed_dates.add(date_key)
                     date_completed = True
                     log(f"Date completed: {date_key}; records collected: {len(date_results)}")
+                    memory = guard.check(force=True)
+                    log(
+                        "Memory telemetry: "
+                        f"date={date_key} rows_inserted={len(date_results)} python_rss_mb={memory.python_rss_mb} "
+                        f"chromium_rss_mb={memory.browser_rss_mb} available_ram_mb={memory.available_ram_mb} "
+                        f"swap_used_mb={memory.swap_used_mb} browser_processes={memory.browser_process_count} "
+                        f"disk_free_gb={memory.disk_free_gb} elapsed_seconds={round(time.perf_counter() - perf_start, 2)}"
+                    )
+                    if config.db_backend == "sqlite":
+                        wal_busy, wal_pages, wal_checkpointed = sqlite_wal_checkpoint("PASSIVE")
+                        log(
+                            "SQLite WAL checkpoint: "
+                            f"busy={wal_busy} pages={wal_pages} checkpointed={wal_checkpointed}"
+                        )
+                    del raw_results
+                    del date_results
+                    gc.collect()
                     completed_count = len([row for row in date_status_rows if row.get("status") in {"completed", "completed_partial", "skipped_resume"}])
                     if retry_settings.auto_export_partial_excel and should_export_snapshot(completed_count, last_snapshot_time, retry_settings.partial_export_frequency):
                         export_partial("running", snapshot=True)
                         last_snapshot_time = time.monotonic()
                     break
+                except ResourceLimitExceeded as exc:
+                    if hasattr(stop_event, "set"):
+                        try:
+                            stop_event.set("resource_limit")
+                        except TypeError:
+                            stop_event.set()
+                    last_error = str(exc)
+                    checkpoint = update_checkpoint_date(
+                        checkpoint,
+                        stay_date=stay_date,
+                        checkout_date=checkout_date,
+                        status="stopped_resource_limit",
+                        attempts=attempt,
+                        records_collected=0,
+                        error=last_error,
+                        metrics=exc.snapshot.as_dict(),
+                    )
+                    save_checkpoint(checkpoint)
+                    push_date_rows(checkpoint)
+                    raise
                 except Exception as exc:
+                    if stop_event.is_set():
+                        last_error = "Stop requested by user."
+                        checkpoint = update_checkpoint_date(
+                            checkpoint,
+                            stay_date=stay_date,
+                            checkout_date=checkout_date,
+                            status="stopped_by_user",
+                            attempts=attempt,
+                            records_collected=0,
+                            error=last_error,
+                        )
+                        save_checkpoint(checkpoint)
+                        push_date_rows(checkpoint)
+                        break
                     classified = classify_scraper_error(exc)
                     last_error = str(classified)
                     if is_browser_closed_error(exc):
@@ -2289,21 +2588,35 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Event, qu
 
         status = final_run_status(date_status_rows, stop_event.is_set(), fatal_error)
         summary = build_summary(status)
-        final_excel_path = export_results_to_excel(normalized_results, summary, EXPORT_DIR)
+        if config.db_backend == "sqlite":
+            final_excel_path = export_sqlite_run_to_excel(run_id, summary, EXPORT_DIR)
+        else:
+            final_excel_path = export_results_to_excel(normalized_results, summary, EXPORT_DIR)
         update_collection_run_excel_path(run_id, str(final_excel_path), backend=config.db_backend)
+        csv_payload = export_final_csv(
+            normalized_results,
+            summary,
+            session_id=run_id,
+            log_callback=log,
+            stream_sqlite_run_id=run_id if config.db_backend == "sqlite" else None,
+        )
         update_collection_run_status(run_id, status, fatal_error, backend=config.db_backend)
         checkpoint["status"] = status
         checkpoint.setdefault("output_files", {})["final_excel"] = str(final_excel_path)
+        checkpoint.setdefault("output_files", {})["final_csv"] = csv_payload.get("csv_file_path")
+        checkpoint.setdefault("output_files", {})["final_csv_status"] = csv_payload.get("csv_export_status")
         save_checkpoint(checkpoint)
-        queue.put(("complete", {"results": normalized_results, "summary": summary, "excel_file_path": str(final_excel_path), "status": status}))
-        update_status_file(status=status, progress_percent=100.0, current_message=f"Collection finished: {status}", latest_excel_file=str(final_excel_path), **price_validation_summary(normalized_results))
+        queue.put(("complete", {"results": normalized_results, "summary": summary, "excel_file_path": str(final_excel_path), "status": status, **csv_payload}))
+        update_status_file(status=status, progress_percent=100.0, current_message=f"Collection finished: {status}", latest_excel_file=str(final_excel_path), **csv_payload, **price_validation_summary(normalized_results))
         log(f"Database run status updated: {status}")
         log(f"Excel file created: {final_excel_path}")
         update_heartbeat(HEARTBEAT_FILE, job_id=getattr(queue, "job_id", None), instance_id=INSTANCE_CONFIG.instance_id, current_date=None, status=status, last_log_message=f"Collection finished: {status}")
     except Exception as exc:
         error_message = str(exc)
         fatal_error = fatal_error or error_message
-        if isinstance(exc, FatalScraperConfigError):
+        if isinstance(exc, ResourceLimitExceeded):
+            status = "stopped_resource_limit"
+        elif isinstance(exc, FatalScraperConfigError):
             status = "fatal_config_error"
         elif not date_status_rows and not normalized_results:
             status = "fatal_startup_error"
@@ -2319,15 +2632,30 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Event, qu
             queue=None,
         )
         log(f"Fatal job error after saving checkpoint/partials: {error_message}")
+        csv_payload: dict[str, Any] = {}
         if run_id is not None:
             if normalized_results and status != "fatal_config_error":
                 summary = build_summary(status)
-                excel_path = export_results_to_excel(normalized_results, summary, EXPORT_DIR, filename="partial_current_run.xlsx")
+                if config.db_backend == "sqlite":
+                    excel_path = export_sqlite_run_to_excel(run_id, summary, EXPORT_DIR, filename="partial_current_run.xlsx")
+                else:
+                    excel_path = export_results_to_excel(normalized_results, summary, EXPORT_DIR, filename="partial_current_run.xlsx")
                 update_collection_run_excel_path(run_id, str(excel_path), backend=config.db_backend)
-                queue.put(("complete", {"results": normalized_results, "summary": summary, "excel_file_path": str(excel_path), "status": status}))
+                csv_payload = export_final_csv(
+                    normalized_results,
+                    summary,
+                    session_id=run_id,
+                    log_callback=log,
+                    stream_sqlite_run_id=run_id if config.db_backend == "sqlite" else None,
+                )
+                queue.put(("complete", {"results": normalized_results, "summary": summary, "excel_file_path": str(excel_path), "status": status, **csv_payload}))
+            elif status != "fatal_config_error":
+                summary = build_summary(status)
+                csv_payload = export_final_csv([], summary, session_id=run_id, log_callback=log)
             update_collection_run_status(run_id, status, error_message, backend=config.db_backend)
-        queue.put(("failed", {"status": status, "error": error_message}))
-        progress(1.0, f"Collection finished: {status}")
+        queue.put(("failed", {"status": status, "error": error_message, **csv_payload}))
+        put_progress(queue, 1.0, f"Collection finished: {status}")
+        update_status_file(status=status, progress_percent=100.0, current_message=f"Collection finished: {status}", last_error=error_message, **csv_payload)
         update_heartbeat(HEARTBEAT_FILE, job_id=getattr(queue, "job_id", None), instance_id=INSTANCE_CONFIG.instance_id, current_date=None, status=status, last_log_message=error_message)
 
 
@@ -2721,7 +3049,12 @@ def run_batch_collection_job(config: CollectionConfig, stop_event: Event, queue:
             "completed_at": datetime.now(),
         },
     )
-    queue.put(("complete", {"results": all_results, "summary": summary, "excel_file_path": str(master_excel_path), "status": status}))
+    csv_payload = export_final_csv(all_results, summary, session_id=batch_id, log_callback=lambda message: put_log(queue, message))
+    checkpoint_payload["master_csv_file_path"] = csv_payload.get("csv_file_path")
+    checkpoint_payload["master_csv_export_status"] = csv_payload.get("csv_export_status")
+    save_batch_checkpoint(config, blocks, checkpoint_payload)
+    update_status_file(status=status, progress_percent=100.0, current_message=f"Batch collection finished: {status}", latest_excel_file=str(master_excel_path), **csv_payload)
+    queue.put(("complete", {"results": all_results, "summary": summary, "excel_file_path": str(master_excel_path), "status": status, **csv_payload}))
     queue.put(("batch_summary", master_summary))
     put_progress(queue, 1.0, f"Batch collection finished: {status}")
     put_log(queue, f"Master Excel file created: {master_excel_path}")
@@ -2740,6 +3073,8 @@ def drain_job_queue() -> None:
         kind = item[0]
         if kind == "log":
             st.session_state.logs.append(item[1])
+            if len(st.session_state.logs) > 500:
+                del st.session_state.logs[:-500]
         elif kind == "progress":
             st.session_state.progress = item[1]
             st.session_state.status_message = item[2]
@@ -2760,32 +3095,68 @@ def drain_job_queue() -> None:
             st.session_state.results = payload["results"]
             st.session_state.summary = payload["summary"]
             st.session_state.excel_file_path = payload["excel_file_path"]
+            st.session_state.csv_file_path = payload.get("csv_file_path")
+            st.session_state.csv_export_status = payload.get("csv_export_status")
+            st.session_state.csv_export_error = payload.get("csv_export_error")
+            st.session_state.csv_rows_exported = payload.get("csv_rows_exported", len(payload["results"]))
             st.session_state.status = payload["status"]
         elif kind == "failed":
             payload = item[1]
             st.session_state.status = payload["status"]
             st.session_state.status_message = payload["error"]
+            if "csv_file_path" in payload:
+                st.session_state.csv_file_path = payload.get("csv_file_path")
+                st.session_state.csv_export_status = payload.get("csv_export_status")
+                st.session_state.csv_export_error = payload.get("csv_export_error")
+                st.session_state.csv_rows_exported = payload.get("csv_rows_exported", 0)
 
-    future: Future = job["future"]
-    if future.done():
+    process = job["process"]
+    stop_requested_at = job.get("stop_requested_at")
+    if process.is_alive() and stop_requested_at is not None:
+        elapsed = time.monotonic() - float(stop_requested_at)
+        if elapsed >= WORKER_STOP_GRACE_SECONDS:
+            cleanup_owned_browser_processes(process.pid, lambda message: st.session_state.logs.append(message))
+            process.terminate()
+            process.join(timeout=3)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=2)
+            st.session_state.status = "stopped_by_user"
+            st.session_state.status_message = "Worker exceeded the stop grace period and was terminated with its scraper-owned browser descendants."
+            update_status_file(
+                status="stopped_by_user",
+                current_message=st.session_state.status_message,
+                forced_worker_termination=True,
+            )
+    if not process.is_alive():
+        process.join(timeout=0.2)
+        exit_code = process.exitcode
+        if st.session_state.status in {"starting", "running", "stopping"}:
+            if stop_requested_at is not None:
+                st.session_state.status = "stopped_by_user"
+                st.session_state.status_message = "Collection stopped by user."
+            elif exit_code not in {0, None}:
+                st.session_state.status = "application_exception"
+                st.session_state.status_message = f"Worker exited unexpectedly with code {exit_code}."
+                update_status_file(status="application_exception", current_message=st.session_state.status_message)
         try:
-            future.result()
-        except Exception as exc:
-            st.session_state.status = "failed"
-            st.session_state.status_message = str(exc)
+            job["queue"].close()
+            job["queue"].join_thread()
+        except (AttributeError, OSError, ValueError):
+            pass
         st.session_state.current_job = None
 
 
 def start_background_job(config: CollectionConfig) -> None:
     reset_current_results()
-    queue: Queue = Queue()
+    context = multiprocessing.get_context("spawn")
+    queue = context.Queue()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / f"instance_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     log_file.write_text("", encoding="utf-8")
-    queue.instance_log_file = str(log_file.resolve())
-    stop_event = Event()
     job_id = str(uuid4())
-    queue.job_id = job_id
+    stop_event = CancellationSignal(context.Event(), CANCEL_FILE, job_id)
+    stop_event.reset()
     write_json_file(
         STATUS_FILE,
         {
@@ -2798,13 +3169,27 @@ def start_background_job(config: CollectionConfig) -> None:
         },
     )
     runner = run_resilient_collection_job if config.batch_mode == "single" else run_batch_collection_job
-    future = EXECUTOR.submit(run_background_job_with_fatal_guard, runner, config, stop_event, queue)
-    st.session_state.current_job = {"id": job_id, "future": future, "queue": queue, "stop_event": stop_event, "log_file": str(log_file.resolve())}
+    process = context.Process(
+        target=run_background_job_with_fatal_guard,
+        args=(runner, config, stop_event, queue, job_id, str(log_file.resolve())),
+        name=f"ota-scraper-{job_id[:8]}",
+        daemon=False,
+    )
+    process.start()
+    st.session_state.current_job = {
+        "id": job_id,
+        "process": process,
+        "queue": queue,
+        "stop_event": stop_event,
+        "log_file": str(log_file.resolve()),
+        "worker_pid": process.pid,
+        "stop_requested_at": None,
+    }
     st.session_state.job_started_at = datetime.now()
     st.session_state.status = "running"
     st.session_state.status_message = f"Collection job started: {job_id}"
     st.session_state.active_log_file_path = str(log_file.resolve())
-    st.session_state.logs = [f"[{datetime.now().strftime('%H:%M:%S')}] Background collection job started: {job_id}", f"[{datetime.now().strftime('%H:%M:%S')}] Log file: {log_file.resolve()}"]
+    st.session_state.logs = [f"[{datetime.now().strftime('%H:%M:%S')}] Worker process started: {job_id} PID={process.pid}", f"[{datetime.now().strftime('%H:%M:%S')}] Log file: {log_file.resolve()}"]
 
 
 def render_job_status() -> None:
@@ -2821,11 +3206,13 @@ def render_job_status() -> None:
 
     status = st.session_state.status
     message = st.session_state.status_message
-    if status in {"failed", "blocked_or_access_restricted"}:
+    if status in {"failed", "blocked_or_access_restricted", "browser_crash", "application_exception", "fatal_startup_error", "fatal_config_error"}:
         status_box.error(message)
-    elif status in {"completed_with_zero_results", "completed_with_partial_results", "stopped_by_user"}:
+    elif status == "stopped_resource_limit":
+        status_box.error(f"{message} Completed data is safe in SQLite and the run is resumable.")
+    elif status in {"completed_with_zero_results", "completed_with_partial_results", "stopped_by_user", "stopped_by_user_with_partial_results", "stopping"}:
         status_box.warning(message)
-    elif status == "completed":
+    elif status in {"completed", "completed_all_dates"}:
         status_box.success(message)
     else:
         status_box.info(message)
@@ -2837,6 +3224,44 @@ def render_job_status() -> None:
     metric_cols[2].metric("Card count", metrics.get("visible_card_count") or metrics.get("current_hotel_card_count", "-"))
     metric_cols[3].metric("Elapsed", metrics.get("elapsed_seconds", metrics.get("elapsed_time", "-")))
     metric_cols[4].metric("Remaining", metrics.get("estimated_remaining_seconds", metrics.get("estimated_remaining_time", "-")))
+    terminal_statuses = {
+        "completed",
+        "completed_all_dates",
+        "completed_with_failed_dates",
+        "completed_with_blocked_dates",
+        "completed_with_partial_results",
+        "completed_with_zero_results",
+        "completed_incomplete",
+        "stopped_by_user",
+        "stopped_by_user_with_partial_results",
+        "stopped_resource_limit",
+        "browser_crash",
+        "application_exception",
+        "refused_second_scraper",
+        "fatal_error_with_partial_results",
+        "failed",
+        "fatal_startup_error",
+        "fatal_config_error",
+    }
+    if status in terminal_statuses:
+        rows_collected = metrics.get("hotels_collected_total")
+        if rows_collected is None:
+            rows_collected = st.session_state.csv_rows_exported or st.session_state.records_saved or len(st.session_state.results)
+        st.write(f"Rows collected: {rows_collected}")
+        csv_status = metrics.get("csv_export_status") or st.session_state.csv_export_status
+        csv_path = metrics.get("csv_file_path") or st.session_state.csv_file_path
+        csv_error = metrics.get("csv_export_error") or st.session_state.csv_export_error
+        if csv_status == "succeeded":
+            st.success("Final CSV export succeeded.")
+            st.write(f"Final CSV path: {csv_path}")
+        elif csv_status == "failed":
+            st.warning("Final CSV export failed.")
+            if csv_error:
+                st.code(str(csv_error), language="text")
+            if metrics.get("csv_export_traceback_file"):
+                st.write(f"CSV export traceback: {metrics.get('csv_export_traceback_file')}")
+        else:
+            st.info("Final CSV export has not run for this session yet.")
     if metrics.get("latest_screenshot_path"):
         st.write(f"Latest screenshot path: {metrics.get('latest_screenshot_path')}")
     if metrics.get("last_error"):
@@ -2903,7 +3328,7 @@ def render_job_status() -> None:
             {"Metric": "Rows missing price", "Value": metrics.get("rows_missing_price", "-")},
             {"Metric": "Price debug file", "Value": metrics.get("price_pipeline_debug_file", "-")},
         ]
-        st.dataframe(pd.DataFrame(completeness_rows), use_container_width=True, hide_index=True)
+        st.dataframe(text_rows_dataframe(completeness_rows), use_container_width=True, hide_index=True)
         if metrics.get("collection_completeness_warning"):
             st.warning(str(metrics["collection_completeness_warning"]))
 
@@ -2972,7 +3397,7 @@ def render_job_status() -> None:
             {"Counter": "Hotels removed by star filter", "Value": metrics.get("hotels_removed_by_star_filter", 0)},
             {"Counter": "Hotels kept after star filter", "Value": metrics.get("hotels_kept_after_star_filter", 0)},
         ]
-        st.dataframe(pd.DataFrame(debug_rows), use_container_width=True, hide_index=True)
+        st.dataframe(text_rows_dataframe(debug_rows), use_container_width=True, hide_index=True)
 
     with st.expander("Live logs", expanded=True):
         st.text("\n".join(st.session_state.logs[-400:]))
@@ -2986,6 +3411,7 @@ def main() -> None:
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    PARTIAL_DIR.mkdir(parents=True, exist_ok=True)
     startup_check = write_startup_check()
 
     with st.sidebar:
@@ -3003,7 +3429,7 @@ def main() -> None:
 
     st.title("Hotel Price Collector")
     render_instance_info()
-    render_period_1_error_panel()
+    render_instance_error_panel()
     with st.expander("Startup self check", expanded=False):
         st.json(startup_check)
     if st.session_state.last_preflight:
@@ -3038,9 +3464,9 @@ def main() -> None:
     with st.sidebar:
         if db_backend == "sqlite":
             st.caption(f"SQLite file: {display_path(SQLITE_DB_PATH)}")
-            if st.button("Reset Period 1 running state only", use_container_width=True, disabled=job_active):
+            if st.button("Reset instance running state only", use_container_width=True, disabled=job_active):
                 reset_period_1_running_state()
-                st.success("Period 1 running state reset. Scraped data was not deleted.")
+                st.success("Instance running state reset. Scraped data was not deleted.")
                 st.rerun()
             confirm_reset_sqlite = st.checkbox("I understand reset deletes local stored runs")
             if st.button("Reset SQLite database", use_container_width=True, disabled=job_active or not confirm_reset_sqlite):
@@ -3099,7 +3525,7 @@ def main() -> None:
         performance_label = st.selectbox(
             "Performance mode",
             ["Debug mode slow but detailed", "Balanced mode recommended"],
-            index=0,
+            index=1,
         )
         performance_mode = "debug" if performance_label.startswith("Debug") else "balanced"
         browser_mode = st.radio(
@@ -3110,7 +3536,7 @@ def main() -> None:
         headless = browser_mode == "Headless reliable mode"
         debug_mode = performance_mode == "debug"
         fast_mode = False
-        screenshots_enabled = True
+        screenshots_enabled = debug_mode
         block_images_and_fonts = False
         if performance_mode == "debug":
             st.caption("Debug mode uses detailed logs, raw card HTML, and screenshots at major steps.")
@@ -3128,11 +3554,12 @@ def main() -> None:
 
         planned_dates = date_range(checkin_start, checkin_end)
         st.header("Batch parallel collection")
-        st.info("Internal parallel workers are experimental. Recommended method is Multi Instance Mode using separate launchers and ports.")
+        st.info("This 8 GB tower is limited to one scraper worker and one scraper browser at a time.")
         batch_label = st.selectbox(
             "Batch collection mode",
-            ["Single run", "Split by week", "Split by month", "Custom date blocks"],
+            ["Single run"],
             index=0,
+            disabled=True,
         )
         batch_mode = {
             "Single run": "single",
@@ -3150,20 +3577,21 @@ def main() -> None:
             disabled=True,
         )
         max_parallel_workers = 1
-        st.warning("Internal parallel workers are disabled for now. Use Multi Instance Mode with separate ports instead.")
+        st.warning("Parallel scraper workers are disabled by the host-wide safety lock.")
         resume_previous_run = st.checkbox("Resume incomplete batch", value=True)
         st.header("Reliability")
         retry_failed_dates_automatically = st.checkbox("Retry failed dates automatically", value=True)
         max_retries_per_date = int(st.selectbox("Max retries per date", [1, 2, 3, 5], index=2))
         continue_if_date_fails = st.checkbox("Continue if one date fails", value=True)
-        auto_export_partial_excel = st.checkbox("Auto export partial Excel", value=True)
+        auto_export_partial_excel = st.checkbox("Auto export periodic partial Excel", value=False)
         partial_frequency_label = st.selectbox(
             "Partial export frequency",
-            ["Every date", "Every 5 dates", "Every 30 minutes"],
+            ["Every 25 dates", "Every 30 minutes", "Every 5 dates"],
             index=0,
+            disabled=not auto_export_partial_excel,
         )
         partial_export_frequency = {
-            "Every date": "every_date",
+            "Every 25 dates": "every_25_dates",
             "Every 5 dates": "every_5_dates",
             "Every 30 minutes": "every_30_minutes",
         }[partial_frequency_label]
@@ -3301,9 +3729,15 @@ def main() -> None:
         clear_clicked = st.button("Clear current dashboard results", use_container_width=True, disabled=job_active)
 
     if stop_clicked and st.session_state.current_job:
-        st.session_state.current_job["stop_event"].set()
-        st.session_state.status_message = "Stop requested. The scraper will stop after the current browser step."
-        st.session_state.status = "running"
+        st.session_state.current_job["stop_event"].set("user")
+        st.session_state.current_job["stop_requested_at"] = time.monotonic()
+        st.session_state.status_message = "Stop requested. Saving the current checkpoint and closing the scraper browser."
+        st.session_state.status = "stopping"
+        update_status_file(
+            status="stopping",
+            current_message=st.session_state.status_message,
+            stop_requested_at=datetime.now().isoformat(sep=" ", timespec="seconds"),
+        )
 
     if refresh_clicked:
         st.rerun()
@@ -3355,8 +3789,8 @@ def main() -> None:
             retry_failed_dates_automatically=True,
             max_retries_per_date=1,
             continue_if_date_fails=True,
-            auto_export_partial_excel=True,
-            partial_export_frequency="every_date",
+            auto_export_partial_excel=False,
+            partial_export_frequency="every_25_dates",
         )
         preflight = run_start_preflight(test_config)
         st.session_state.last_preflight = preflight
@@ -3423,6 +3857,7 @@ def main() -> None:
     st.write(f"Open log folder path: {LOG_DIR.resolve()}")
     st.write(f"Latest debug folder path: {DEBUG_DIR.resolve()}")
     st.write(f"Latest Excel export path: {st.session_state.excel_file_path or read_current_status_file().get('latest_excel_file') or 'No export yet'}")
+    st.write(f"Latest CSV export path: {st.session_state.csv_file_path or read_current_status_file().get('csv_file_path') or 'No CSV export yet'}")
     if st.button("Copy diagnostic summary", use_container_width=True):
         st.text_area("Diagnostic summary", value=build_diagnostic_summary(), height=220)
 

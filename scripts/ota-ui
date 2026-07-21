@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV_DIR="$PROJECT_DIR/.venv"
+STREAMLIT="$VENV_DIR/bin/streamlit"
+PORT="${INSTANCE_PORT:-8501}"
+DATA_DIR="${INSTANCE_DATA_DIR:-data/instances/instance_1}"
+if [[ "$DATA_DIR" != /* ]]; then
+  DATA_DIR="$PROJECT_DIR/$DATA_DIR"
+fi
+STATUS_DIR="$DATA_DIR/status"
+LOG_DIR="$DATA_DIR/logs"
+PID_FILE="$STATUS_DIR/streamlit.pid"
+CURRENT_LOG_FILE="$STATUS_DIR/streamlit_current_log.txt"
+UNIT_NAME="ota-ui.service"
+
+mkdir -p "$STATUS_DIR" "$LOG_DIR"
+
+die() {
+  echo "[ota-ui] ERROR: $*" >&2
+  exit 1
+}
+
+require_runtime() {
+  [[ -x "$VENV_DIR/bin/python" ]] || die "Missing virtual environment. Run: scripts/setup-linux"
+  [[ -x "$STREAMLIT" ]] || die "Streamlit is missing. Run: scripts/setup-linux"
+  "$VENV_DIR/bin/python" -c "import streamlit, playwright" >/dev/null 2>&1 || die "Python dependencies are incomplete. Run: scripts/setup-linux"
+}
+
+pid_is_ours() {
+  local pid="$1"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  local command
+  command="$(tr '\0' ' ' < "/proc/$pid/cmdline")"
+  [[ "$command" == *"streamlit"*"app.py"* ]] && [[ "$command" == *"$PORT"* ]]
+}
+
+recorded_pid() {
+  [[ -r "$PID_FILE" ]] || return 1
+  tr -dc '0-9' < "$PID_FILE"
+}
+
+port_owner_line() {
+  ss -ltnp "sport = :$PORT" 2>/dev/null | awk 'NR > 1 {print; exit}'
+}
+
+service_available() {
+  systemctl --user cat "$UNIT_NAME" >/dev/null 2>&1
+}
+
+serve() {
+  require_runtime
+  cd "$PROJECT_DIR"
+  local owner
+  owner="$(port_owner_line || true)"
+  [[ -z "$owner" ]] || die "Port $PORT is already occupied: $owner"
+  local stamp log_file
+  stamp="$(date +%Y%m%d_%H%M%S)"
+  log_file="$LOG_DIR/streamlit_${stamp}.log"
+  printf '%s\n' "$$" > "$PID_FILE"
+  printf '%s\n' "$log_file" > "$CURRENT_LOG_FILE"
+  export INSTANCE_ID="${INSTANCE_ID:-instance_1}"
+  export INSTANCE_NAME="${INSTANCE_NAME:-Instance 1}"
+  export INSTANCE_PORT="$PORT"
+  export INSTANCE_DATA_DIR="${INSTANCE_DATA_DIR:-data/instances/instance_1}"
+  export DB_BACKEND="${DB_BACKEND:-sqlite}"
+  echo "[ota-ui] PID=$$ port=$PORT log=$log_file"
+  {
+    echo "startup_time=$(date -Is)"
+    echo "project_dir=$PROJECT_DIR"
+    echo "application_branch=$(git -C "$PROJECT_DIR" branch --show-current 2>/dev/null || echo unknown)"
+    echo "application_commit=$(git -C "$PROJECT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    "$VENV_DIR/bin/python" -c 'import sys; from importlib.metadata import version; print("python=" + sys.version.split()[0]); print("streamlit=" + version("streamlit")); print("playwright=" + version("playwright"))'
+    "$VENV_DIR/bin/python" -c 'import subprocess; from playwright.sync_api import sync_playwright; p=sync_playwright().start(); path=p.chromium.executable_path; print("chromium_executable=" + path); result=subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10); print("chromium=" + (result.stdout or result.stderr).strip()); p.stop()'
+  } >> "$log_file" 2>&1
+  exec "$STREAMLIT" run app.py --server.port "$PORT" --server.address 0.0.0.0 --server.headless true >> "$log_file" 2>&1
+}
+
+start() {
+  require_runtime
+  local pid owner
+  pid="$(recorded_pid || true)"
+  if [[ -n "$pid" ]] && pid_is_ours "$pid"; then
+    echo "[ota-ui] Already running: PID=$pid port=$PORT"
+    return 0
+  fi
+  owner="$(port_owner_line || true)"
+  [[ -z "$owner" ]] || die "Port $PORT is occupied by another process: $owner"
+  if service_available; then
+    systemctl --user start "$UNIT_NAME"
+    sleep 1
+  else
+    nohup "$0" serve </dev/null >/dev/null 2>&1 &
+    sleep 1
+  fi
+  status
+}
+
+stop() {
+  if service_available && systemctl --user is-active --quiet "$UNIT_NAME"; then
+    systemctl --user stop "$UNIT_NAME"
+    echo "[ota-ui] Stopped $UNIT_NAME"
+    return 0
+  fi
+  local pid
+  pid="$(recorded_pid || true)"
+  if [[ -z "$pid" ]] || ! pid_is_ours "$pid"; then
+    echo "[ota-ui] No project Streamlit process is running."
+    return 0
+  fi
+  kill -TERM "$pid"
+  for _attempt in {1..20}; do
+    pid_is_ours "$pid" || break
+    sleep 0.25
+  done
+  if pid_is_ours "$pid"; then
+    die "PID $pid did not stop after 5 seconds; it was not force-killed."
+  fi
+  echo "[ota-ui] Stopped PID=$pid"
+}
+
+status() {
+  local pid owner log_file service_state
+  pid="$(recorded_pid || true)"
+  owner="$(port_owner_line || true)"
+  log_file="$(head -n 1 "$CURRENT_LOG_FILE" 2>/dev/null || true)"
+  service_state="not-installed"
+  if service_available; then
+    service_state="$(systemctl --user is-active "$UNIT_NAME" 2>/dev/null || true)"
+  fi
+  echo "[ota-ui] service=$service_state"
+  if [[ -n "$pid" ]] && pid_is_ours "$pid"; then
+    echo "[ota-ui] process=running PID=$pid"
+  else
+    echo "[ota-ui] process=not-running"
+  fi
+  if [[ -n "$owner" ]]; then
+    echo "[ota-ui] port=$PORT listening"
+    echo "[ota-ui] $owner"
+  else
+    echo "[ota-ui] port=$PORT not-listening"
+  fi
+  echo "[ota-ui] local=http://localhost:$PORT/ network=http://192.168.1.144:$PORT/"
+  echo "[ota-ui] log=${log_file:-none}"
+}
+
+logs() {
+  local log_file
+  log_file="$(head -n 1 "$CURRENT_LOG_FILE" 2>/dev/null || true)"
+  [[ -n "$log_file" && -r "$log_file" ]] || die "No Streamlit log is available yet."
+  echo "[ota-ui] $log_file"
+  tail -n "${OTA_LOG_LINES:-120}" "$log_file"
+}
+
+install_service() {
+  local source_unit="$PROJECT_DIR/systemd/$UNIT_NAME"
+  local target_dir="$HOME/.config/systemd/user"
+  [[ -r "$source_unit" ]] || die "Missing $source_unit"
+  mkdir -p "$target_dir"
+  install -m 0644 "$source_unit" "$target_dir/$UNIT_NAME"
+  systemctl --user daemon-reload
+  systemctl --user enable "$UNIT_NAME"
+  echo "[ota-ui] Installed and enabled $target_dir/$UNIT_NAME"
+}
+
+case "${1:-status}" in
+  serve) serve ;;
+  start) start ;;
+  stop) stop ;;
+  restart) stop; start ;;
+  status) status ;;
+  logs) logs ;;
+  install-service) install_service ;;
+  *) die "Usage: scripts/ota-ui {start|stop|restart|status|logs|install-service}" ;;
+esac

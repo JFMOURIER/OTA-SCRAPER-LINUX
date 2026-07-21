@@ -18,6 +18,7 @@ DATE_TERMINAL_STATUSES = {
     "blocked_or_access_restricted",
     "skipped_resume",
     "stopped_by_user",
+    "stopped_resource_limit",
 }
 
 
@@ -28,8 +29,8 @@ class RetrySettings:
     retry_delay_seconds: int = 30
     restart_browser_between_retries: bool = True
     continue_if_date_fails: bool = True
-    auto_export_partial_excel: bool = True
-    partial_export_frequency: str = "every_date"
+    auto_export_partial_excel: bool = False
+    partial_export_frequency: str = "every_25_dates"
     resume_from_checkpoint: bool = True
 
 
@@ -244,13 +245,45 @@ def heartbeat_is_stale(path: Path, stale_after_seconds: int = 90) -> bool:
 
 
 def should_export_snapshot(completed_count: int, last_snapshot_time: float, frequency: str) -> bool:
-    if frequency == "every_date":
-        return False
+    if frequency == "every_25_dates":
+        return completed_count > 0 and completed_count % 25 == 0
     if frequency == "every_5_dates":
         return completed_count > 0 and completed_count % 5 == 0
     if frequency == "every_30_minutes":
         return time.monotonic() - last_snapshot_time >= 30 * 60
     return False
+
+
+class CancellationSignal:
+    """A multiprocessing Event plus an atomic file usable after UI reruns/restarts."""
+
+    def __init__(self, event: Any, path: str | Path, job_id: str) -> None:
+        self.event = event
+        self.path = Path(path)
+        self.job_id = job_id
+
+    def reset(self) -> None:
+        self.event.clear()
+        atomic_write_json(
+            self.path,
+            {"job_id": self.job_id, "cancel_requested": False, "updated_at": now_text()},
+        )
+
+    def set(self, reason: str = "user") -> None:
+        self.event.set()
+        atomic_write_json(
+            self.path,
+            {"job_id": self.job_id, "cancel_requested": True, "reason": reason, "updated_at": now_text()},
+        )
+
+    def is_set(self) -> bool:
+        if self.event.is_set():
+            return True
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return False
+        return bool(payload.get("job_id") == self.job_id and payload.get("cancel_requested"))
 
 
 def final_run_status(date_rows: list[dict[str, Any]], stopped: bool, fatal_error: str | None = None) -> str:

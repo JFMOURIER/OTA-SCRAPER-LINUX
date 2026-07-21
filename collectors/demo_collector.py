@@ -69,7 +69,7 @@ class DemoCollector(BaseCollector):
                     adults=adults,
                     currency=currency,
                     hotel_name=hotel_name,
-                    hotel_url="demo://hotel",
+                    hotel_url=f"demo://hotel/{index + 1:05d}",
                     star_rating=star_rating,
                     review_score=review_score,
                     review_count=random.randint(25, 4200),

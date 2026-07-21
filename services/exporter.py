@@ -1,17 +1,39 @@
 from __future__ import annotations
 
+import csv
 import re
 import os
 import json
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pandas as pd
+import xlsxwriter
 
 from services.date_utils import format_date_for_filename, format_timestamp_for_filename
 from services.normalizer import RESULT_FIELDS
+
+
+CSV_EXPORT_COLUMNS = [
+    "source_website",
+    "hotel_name",
+    "star_rating",
+    "review_score",
+    "number_of_reviews",
+    "cheapest_visible_price",
+    "currency",
+    "hotel_url",
+    "destination_city",
+    "checkin_date",
+    "checkout_date",
+    "timestamp",
+    "scrape_session_id",
+    "instance_id",
+    "error_message",
+]
 
 
 def safe_filename(text: str) -> str:
@@ -33,6 +55,18 @@ def build_excel_filename(source: str, city_or_region: str, checkin_date: Any, nu
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return f"{source_part}_{city_part.lower()}_{instance_id}_{start_date}_to_{end_date}_{timestamp}.xlsx"
     return f"{source_part}_{city_part}_{date_part}_{number_of_nights}_nights_{timestamp}.xlsx"
+
+
+def downloads_dir() -> Path:
+    return Path.home() / "Downloads"
+
+
+def build_csv_filename(source: str, city_or_region: str, instance_id: str, exported_at: datetime | None = None) -> str:
+    timestamp = (exported_at or datetime.now()).strftime("%Y-%m-%d_%H-%M-%S")
+    source_part = safe_filename(str(source or "source").lower().replace(".com", ""))
+    city_part = safe_filename(str(city_or_region or "city").lower())
+    instance_part = safe_filename(str(instance_id or "default").lower())
+    return f"ota_results_{source_part}_{city_part}_{instance_part}_{timestamp}.csv"
 
 
 def _numeric_values(results: list[dict[str, Any]], field: str) -> list[float]:
@@ -152,6 +186,87 @@ def _serialize_for_excel(value: Any) -> Any:
     return value
 
 
+def _serialize_for_csv(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, datetime):
+        return value.isoformat(sep=" ", timespec="seconds")
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=True, default=str)
+    return "" if value is None else value
+
+
+def _first_present(row: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = row.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _summary_or_first_row(summary: dict[str, Any], results: list[dict[str, Any]], key: str, default: Any = None) -> Any:
+    value = summary.get(key)
+    if value is not None and value != "":
+        return value
+    for row in results:
+        value = row.get(key)
+        if value is not None and value != "":
+            return value
+    return default
+
+
+def _result_csv_row(row: dict[str, Any], *, session_id: Any, instance_id: str, exported_at: datetime) -> dict[str, Any]:
+    return {
+        "source_website": _serialize_for_csv(row.get("source")),
+        "hotel_name": _serialize_for_csv(row.get("hotel_name")),
+        "star_rating": _serialize_for_csv(row.get("star_rating")),
+        "review_score": _serialize_for_csv(row.get("review_score")),
+        "number_of_reviews": _serialize_for_csv(row.get("review_count")),
+        "cheapest_visible_price": _serialize_for_csv(_first_present(row, "cheapest_price_total", "parsed_price", "raw_price_text")),
+        "currency": _serialize_for_csv(row.get("currency")),
+        "hotel_url": _serialize_for_csv(row.get("hotel_url")),
+        "destination_city": _serialize_for_csv(row.get("city_or_region")),
+        "checkin_date": _serialize_for_csv(row.get("checkin_date")),
+        "checkout_date": _serialize_for_csv(row.get("checkout_date")),
+        "timestamp": _serialize_for_csv(row.get("collected_at") or exported_at),
+        "scrape_session_id": _serialize_for_csv(session_id or row.get("collection_run_id")),
+        "instance_id": _serialize_for_csv(instance_id),
+        "error_message": _serialize_for_csv(row.get("error_message")),
+    }
+
+
+def export_results_to_csv(
+    results: list[dict[str, Any]],
+    summary: dict[str, Any],
+    output_dir: str | Path | None = None,
+    filename: str | None = None,
+    *,
+    instance_id: str | None = None,
+    session_id: Any = None,
+) -> Path:
+    exported_at = datetime.now()
+    output_path = Path(output_dir) if output_dir is not None else downloads_dir()
+    output_path.mkdir(parents=True, exist_ok=True)
+    source = _summary_or_first_row(summary, results, "source", "source")
+    city = _summary_or_first_row(summary, results, "city_or_region", "city")
+    resolved_instance_id = instance_id or str(summary.get("instance_id") or os.getenv("INSTANCE_ID") or "default")
+    resolved_session_id = session_id or summary.get("scrape_session_id") or summary.get("run_id")
+    csv_path = output_path / (filename or build_csv_filename(str(source), str(city), str(resolved_instance_id), exported_at))
+
+    tmp_path = csv_path.with_name(f".{csv_path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+    with tmp_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_EXPORT_COLUMNS)
+        writer.writeheader()
+        for row in results:
+            writer.writerow(_result_csv_row(row, session_id=resolved_session_id, instance_id=str(resolved_instance_id), exported_at=exported_at))
+        handle.flush()
+        os.fsync(handle.fileno())
+    tmp_path.replace(csv_path)
+    return csv_path.resolve()
+
+
 def _results_dataframe(results: list[dict[str, Any]]) -> pd.DataFrame:
     df = pd.DataFrame([{key: _serialize_for_excel(value) for key, value in row.items()} for row in results])
     if df.empty:
@@ -246,6 +361,7 @@ def export_results_to_excel(results: list[dict[str, Any]], summary: dict[str, An
         int(summary.get("number_of_nights") or 1),
     )
     file_path = output_path / filename
+    tmp_path = file_path.with_name(f".{file_path.stem}.{os.getpid()}.{uuid4().hex}.tmp{file_path.suffix}")
 
     results_df = _results_dataframe(results)
     date_status_rows = summary.get("__date_status_rows") if isinstance(summary.get("__date_status_rows"), list) else []
@@ -262,7 +378,7 @@ def export_results_to_excel(results: list[dict[str, Any]], summary: dict[str, An
     errors_df = _errors_dataframe(results_df)
     raw_debug_df = _raw_api_debug_dataframe(results_df)
 
-    with pd.ExcelWriter(file_path, engine="xlsxwriter") as writer:
+    with pd.ExcelWriter(tmp_path, engine="xlsxwriter") as writer:
         results_df.to_excel(writer, index=False, sheet_name="All Results")
         by_date_df.to_excel(writer, index=False, sheet_name="By Date Summary")
         by_source_df.to_excel(writer, index=False, sheet_name="By Source Summary")
@@ -308,6 +424,7 @@ def export_results_to_excel(results: list[dict[str, Any]], summary: dict[str, An
         summary_sheet.set_column(0, 0, 32)
         summary_sheet.set_column(1, 1, 48)
 
+    tmp_path.replace(file_path)
     return file_path.resolve()
 
 
@@ -322,6 +439,7 @@ def export_batch_master_excel(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     file_path = output_path / filename
+    tmp_path = file_path.with_name(f".{file_path.stem}.{os.getpid()}.{uuid4().hex}.tmp{file_path.suffix}")
 
     results_df = _results_dataframe(results)
     block_df = pd.DataFrame(block_rows)
@@ -336,7 +454,7 @@ def export_batch_master_excel(
         errors_df = pd.concat([errors_df, incomplete_df], ignore_index=True, sort=False)
     raw_debug_df = _raw_api_debug_dataframe(results_df)
 
-    with pd.ExcelWriter(file_path, engine="xlsxwriter") as writer:
+    with pd.ExcelWriter(tmp_path, engine="xlsxwriter") as writer:
         results_df.to_excel(writer, index=False, sheet_name="All Results")
         by_date_df.to_excel(writer, index=False, sheet_name="By Date Summary")
         by_source_df.to_excel(writer, index=False, sheet_name="By Source Summary")
@@ -374,4 +492,172 @@ def export_batch_master_excel(
                     fmt = date_format
                 sheet.set_column(idx, idx, width, fmt)
 
+    tmp_path.replace(file_path)
     return file_path.resolve()
+
+
+def _stream_cell(value: Any) -> Any:
+    value = _serialize_for_excel(value)
+    if isinstance(value, str) and len(value) > 32767:
+        return value[:32764] + "..."
+    return value
+
+
+def export_sqlite_run_to_excel(
+    run_id: int,
+    summary: dict[str, Any],
+    output_dir: str | Path,
+    filename: str | None = None,
+    *,
+    batch_size: int = 500,
+) -> Path:
+    """Export a run with bounded memory and an atomic final rename."""
+
+    from database.db import iter_sqlite_results_by_run_id
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    filename = filename or build_excel_filename(
+        str(summary.get("source") or "source"),
+        str(summary.get("city_or_region") or "city"),
+        summary.get("checkin_date"),
+        int(summary.get("number_of_nights") or 1),
+    )
+    file_path = output_path / filename
+    tmp_path = file_path.with_name(f".{file_path.stem}.{os.getpid()}.{uuid4().hex}.tmp{file_path.suffix}")
+    columns = list(RESULT_FIELDS)
+    raw_columns = ["source", "provider_name", "hotel_name", "checkin_date", "raw_source_payload", "error_message"]
+    by_date: dict[tuple[str, str], dict[str, Any]] = {}
+    by_source: dict[str, dict[str, Any]] = {}
+
+    workbook = xlsxwriter.Workbook(str(tmp_path), {"constant_memory": True})
+    try:
+        sheets = {
+            "All Results": workbook.add_worksheet("All Results"),
+            "Errors": workbook.add_worksheet("Errors"),
+            "Raw API Debug": workbook.add_worksheet("Raw API Debug"),
+        }
+        for col, name in enumerate(columns):
+            sheets["All Results"].write(0, col, name)
+            sheets["Errors"].write(0, col, name)
+        for col, name in enumerate(raw_columns):
+            sheets["Raw API Debug"].write(0, col, name)
+        result_row = error_row = raw_row = 1
+        for batch in iter_sqlite_results_by_run_id(run_id, batch_size=batch_size):
+            for result in batch:
+                for col, name in enumerate(columns):
+                    sheets["All Results"].write(result_row, col, _stream_cell(result.get(name)))
+                result_row += 1
+                is_error = str(result.get("collection_status") or "success") != "success"
+                if is_error:
+                    for col, name in enumerate(columns):
+                        sheets["Errors"].write(error_row, col, _stream_cell(result.get(name)))
+                    error_row += 1
+                if result.get("raw_source_payload"):
+                    for col, name in enumerate(raw_columns):
+                        sheets["Raw API Debug"].write(raw_row, col, _stream_cell(result.get(name)))
+                    raw_row += 1
+                checkin = str(result.get("checkin_date") or "")
+                checkout = str(result.get("checkout_date") or "")
+                date_bucket = by_date.setdefault((checkin, checkout), {"hotels": 0, "errors": 0, "price_count": 0, "price_sum": 0.0, "price_min": None})
+                source_bucket = by_source.setdefault(str(result.get("source") or ""), {"hotels": 0, "errors": 0, "price_count": 0, "price_sum": 0.0, "price_min": None})
+                if result.get("hotel_name"):
+                    date_bucket["hotels"] += 1
+                    source_bucket["hotels"] += 1
+                date_bucket["errors"] += int(is_error)
+                source_bucket["errors"] += int(is_error)
+                try:
+                    price = float(result.get("cheapest_price_total"))
+                except (TypeError, ValueError):
+                    price = None
+                if price is not None:
+                    for bucket in (date_bucket, source_bucket):
+                        bucket["price_count"] += 1
+                        bucket["price_sum"] += price
+                        bucket["price_min"] = price if bucket["price_min"] is None else min(bucket["price_min"], price)
+            del batch
+
+        by_date_sheet = workbook.add_worksheet("By Date Summary")
+        by_date_headers = ["checkin_date", "checkout_date", "hotels_collected", "errors", "lowest_price", "average_price"]
+        for col, name in enumerate(by_date_headers):
+            by_date_sheet.write(0, col, name)
+        for row_index, ((checkin, checkout), values) in enumerate(sorted(by_date.items()), start=1):
+            count = values["price_count"]
+            row = [checkin, checkout, values["hotels"], values["errors"], values["price_min"], values["price_sum"] / count if count else None]
+            for col, value in enumerate(row):
+                by_date_sheet.write(row_index, col, value)
+
+        by_source_sheet = workbook.add_worksheet("By Source Summary")
+        source_headers = ["source", "hotels_collected", "errors", "lowest_price", "average_price"]
+        for col, name in enumerate(source_headers):
+            by_source_sheet.write(0, col, name)
+        for row_index, (source, values) in enumerate(sorted(by_source.items()), start=1):
+            count = values["price_count"]
+            row = [source, values["hotels"], values["errors"], values["price_min"], values["price_sum"] / count if count else None]
+            for col, value in enumerate(row):
+                by_source_sheet.write(row_index, col, value)
+
+        date_status_sheet = workbook.add_worksheet("Date Status")
+        date_status_rows = summary.get("__date_status_rows") if isinstance(summary.get("__date_status_rows"), list) else []
+        date_status_columns = sorted({key for row in date_status_rows for key in row})
+        for col, name in enumerate(date_status_columns):
+            date_status_sheet.write(0, col, name)
+        for row_index, row in enumerate(date_status_rows, start=1):
+            for col, name in enumerate(date_status_columns):
+                date_status_sheet.write(row_index, col, _stream_cell(row.get(name)))
+
+        summary_sheet = workbook.add_worksheet("Run Summary")
+        summary_sheet.write_row(0, 0, ["Metric", "Value"])
+        public_summary = {key: value for key, value in summary.items() if not str(key).startswith("__")}
+        public_summary["rows exported"] = result_row - 1
+        for row_index, (key, value) in enumerate(public_summary.items(), start=1):
+            summary_sheet.write(row_index, 0, str(key))
+            summary_sheet.write(row_index, 1, _stream_cell(value))
+
+        for sheet in [*sheets.values(), by_date_sheet, by_source_sheet, date_status_sheet, summary_sheet]:
+            sheet.freeze_panes(1, 0)
+        sheets["All Results"].autofilter(0, 0, max(0, result_row - 1), len(columns) - 1)
+        for sheet in sheets.values():
+            sheet.set_column(0, max(len(columns) - 1, 0), 18)
+    except Exception:
+        workbook.close()
+        raise
+    else:
+        workbook.close()
+    tmp_path.replace(file_path)
+    return file_path.resolve()
+
+
+def export_sqlite_run_to_csv(
+    run_id: int,
+    summary: dict[str, Any],
+    output_dir: str | Path,
+    filename: str | None = None,
+    *,
+    instance_id: str = "default",
+    batch_size: int = 500,
+) -> Path:
+    from database.db import iter_sqlite_results_by_run_id
+
+    exported_at = datetime.now()
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    filename = filename or build_csv_filename(
+        str(summary.get("source") or "source"),
+        str(summary.get("city_or_region") or "city"),
+        instance_id,
+        exported_at,
+    )
+    csv_path = output_path / filename
+    tmp_path = csv_path.with_name(f".{csv_path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+    with tmp_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_EXPORT_COLUMNS)
+        writer.writeheader()
+        for batch in iter_sqlite_results_by_run_id(run_id, batch_size=batch_size):
+            for row in batch:
+                writer.writerow(_result_csv_row(row, session_id=run_id, instance_id=instance_id, exported_at=exported_at))
+            del batch
+        handle.flush()
+        os.fsync(handle.fileno())
+    tmp_path.replace(csv_path)
+    return csv_path.resolve()

@@ -79,6 +79,10 @@ class InstanceConfig:
         return self.data_dir / "checkpoints" if self.active else BASE_DIR / "data" / "checkpoints"
 
     @property
+    def partial_dir(self) -> Path:
+        return self.data_dir / "partial" if self.active else BASE_DIR / "data" / "partial"
+
+    @property
     def status_dir(self) -> Path:
         return self.data_dir / "status" if self.active else BASE_DIR / "data" / "status"
 
@@ -88,7 +92,7 @@ class InstanceConfig:
 
     def ensure_directories(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        for path in [self.export_dir, self.screenshot_dir, self.debug_dir, self.log_dir, self.browser_profile_dir, self.checkpoint_dir, self.status_dir]:
+        for path in [self.export_dir, self.screenshot_dir, self.debug_dir, self.log_dir, self.browser_profile_dir, self.checkpoint_dir, self.partial_dir, self.status_dir]:
             path.mkdir(parents=True, exist_ok=True)
 
 

@@ -1,13 +1,56 @@
 # OTA-SCRAPER-LINUX
 
+## Safe Linux tower operation
+
+Normal starts never install or upgrade packages. Run setup separately, once:
+
+```bash
+cd /home/jf/Projects/OTA-SCRAPER-LINUX
+scripts/setup-linux
+scripts/ota-ui install-service
+```
+
+Operate the Streamlit interface with:
+
+```bash
+scripts/ota-ui start
+scripts/ota-ui stop
+scripts/ota-ui restart
+scripts/ota-ui status
+scripts/ota-ui logs
+```
+
+The main instance binds explicitly to `0.0.0.0:8501` and uses
+`data/instances/instance_1`. Dependency and browser updates are an explicit
+maintenance action via `scripts/update-dependencies`.
+
+The scraper is limited to one managed worker/browser. SQLite is the live data
+store; successful-run screenshots are off by default; partial Excel snapshots
+are off by default and, when enabled, default to every 25 completed dates.
+Resource thresholds can be adjusted with `OTA_MIN_START_AVAILABLE_MB`,
+`OTA_EMERGENCY_AVAILABLE_MB`, `OTA_MIN_SWAP_FREE_MB`,
+`OTA_WARN_BROWSER_RSS_MB`, and `OTA_STOP_BROWSER_RSS_MB`.
+
+Run a controlled one-date diagnostic (maximum 10 properties) with:
+
+```bash
+scripts/run-scraper-diagnostic --destination Orlando --date 2026-08-01 --max-properties 3 --mode both
+```
+
+Read and export a SQLite database without modifying it with:
+
+```bash
+scripts/recover-data data/instances/instance_1/hotel_price_collector.sqlite
+```
+
 ## A. Project description
 
 OTA-SCRAPER-LINUX is the Ubuntu/Linux version of the OTA hotel price scraper. It keeps the Streamlit dashboard, scraping workflow, local SQLite storage, Excel exports, checkpoints, screenshots, and visible logs from the working OTA Scraper while using Linux-compatible paths and Playwright Chromium setup.
 
-The app can be launched with:
+The app can be launched manually with:
 
 ```bash
-streamlit run app.py
+.venv/bin/streamlit run app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
 ```
 
 Runtime files are created locally under `data/`, including exports, SQLite databases, screenshots, debug files, checkpoints, browser profiles, partial scrape files, and logs.
@@ -96,7 +139,7 @@ The default configuration uses SQLite:
 
 ```text
 DB_BACKEND=sqlite
-INSTANCE_DATA_DIR=data/instances/period_1
+INSTANCE_DATA_DIR=data/instances/instance_1
 ```
 
 Only add real API keys or database passwords to `.env`. Do not commit `.env`; it is ignored by git.
@@ -110,11 +153,10 @@ chmod +x run_linux.sh
 ./run_linux.sh
 ```
 
-Manual launch:
+Manual launch (the `server.headless` setting affects Streamlit, not the scraper browser mode):
 
 ```bash
-source .venv/bin/activate
-streamlit run app.py
+.venv/bin/streamlit run app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
 ```
 
 Use another port if `8501` is already busy:
@@ -123,7 +165,14 @@ Use another port if `8501` is already busy:
 streamlit run app.py --server.port 8502
 ```
 
-## I. Troubleshooting
+## I. Single-scraper safety limit
+
+Do not run the legacy `run_scraper_1.sh`, `run_scraper_2.sh`, or
+`run_scraper_3.sh` launchers concurrently on this 8 GB tower. The supported UI
+launcher is `scripts/ota-ui`, and a host-wide lock refuses a second scraper
+worker even if another interface is open.
+
+## J. Troubleshooting
 
 `ModuleNotFoundError`: activate the virtual environment and reinstall requirements.
 
@@ -147,31 +196,29 @@ chmod +x run_linux.sh
 The app starts and stops without obvious output: check the Streamlit log panel and local files under:
 
 ```text
-data/instances/period_1/logs/
-data/instances/period_1/status/
-data/instances/period_1/debug/
+data/instances/instance_1/logs/
+data/instances/instance_1/status/
+data/instances/instance_1/debug/
 ```
 
 CAPTCHA or access restriction: the scraper is designed to stop safely, save partial results where possible, and mark the date as blocked. It does not bypass website security controls.
 
-## J. GitHub update workflow
+## K. GitHub update workflow
 
 Use this workflow when updating the Linux project from the Linux tower PC:
 
 ```bash
 cd ~/OTA-SCRAPER-LINUX
 git pull
-source .venv/bin/activate
-pip install -r requirements.txt
-python -m playwright install --with-deps chromium
-streamlit run app.py
+scripts/update-dependencies
+scripts/ota-ui restart
 ```
 
 To save your own code changes:
 
 ```bash
 git status
-git add app.py collectors services database tools requirements.txt README.md .gitignore .env.example run_linux.sh
+git add app.py collectors services database tools requirements.txt README.md .gitignore .env.example run_linux.sh run_scraper_1.sh run_scraper_2.sh run_scraper_3.sh
 git commit -m "Describe your Linux scraper update"
 git push
 ```

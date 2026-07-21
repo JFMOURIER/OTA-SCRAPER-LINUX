@@ -10,7 +10,14 @@ from playwright.sync_api import sync_playwright
 
 from collectors.base import BaseCollector, CollectorOptions, LogCallback, ProgressCallback
 from services.date_utils import format_timestamp_for_filename
-from services.playwright_safe import safe_close_browser, safe_page_title, safe_page_url, safe_screenshot
+from services.playwright_safe import (
+    interruptible_page_wait,
+    launch_managed_chromium_context,
+    safe_close_browser,
+    safe_page_title,
+    safe_page_url,
+    safe_screenshot,
+)
 from services.scraper_errors import AccessRestrictionError, BrowserClosedError, is_access_restriction_error, is_browser_closed_error
 
 
@@ -48,18 +55,31 @@ class ExpediaPlaywrightCollector(BaseCollector):
 
         with sync_playwright() as playwright:
             browser = None
+            context = None
             page = None
             try:
-                browser = playwright.chromium.launch(headless=options.headless, args=["--disable-dev-shm-usage"])
-                page = browser.new_page(viewport={"width": 1366, "height": 900})
+                browser, context, implementation = launch_managed_chromium_context(
+                    playwright,
+                    headless=options.headless,
+                    profile_dir=options.browser_profile_dir,
+                    args=["--disable-dev-shm-usage", "--disable-background-networking"],
+                    viewport={"width": 1366, "height": 900},
+                    log=log_callback,
+                )
+                options.stats["browser_implementation"] = implementation
+                page = context.new_page()
+                page.set_default_timeout(15000)
+                page.set_default_navigation_timeout(45000)
                 self.log(log_callback, "Expedia Chromium browser launched.")
+                self.log(log_callback, "Expedia Playwright page ready with 15s selector timeout and 45s navigation timeout.")
                 self.log(log_callback, f"Search URL opened: {search_url}")
                 try:
                     page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
                 except PlaywrightTimeoutError as exc:
                     self.log(log_callback, f"Expedia page load timed out: {exc}")
                     raise
-                page.wait_for_timeout(3000)
+                if not interruptible_page_wait(page, 3000, options.stop_event):
+                    raise RuntimeError("stopped_by_user: cancelled during Expedia page load")
                 self.log(log_callback, f"Final URL after redirect: {safe_page_url(page, log_callback)}")
                 self.log(log_callback, f"Page title: {safe_page_title(page, log_callback)}")
                 initial_screenshot = screenshot_dir / f"expedia_initial_{format_timestamp_for_filename()}.png"
@@ -89,7 +109,9 @@ class ExpediaPlaywrightCollector(BaseCollector):
                         self.log(log_callback, f"Maximum scroll time reached ({options.max_scroll_minutes} minutes); stopping Expedia scroll.")
                         break
                     page.mouse.wheel(0, 1800)
-                    page.wait_for_timeout(900 if options.fast_mode else 1400)
+                    if not interruptible_page_wait(page, 900 if options.fast_mode else 1400, options.stop_event):
+                        self.log(log_callback, "Stop requested during Expedia scroll wait.")
+                        break
                     current_count = page.locator(card_selector).count()
                     self.log(log_callback, f"Scroll {scroll_index + 1}: {current_count} Expedia cards found")
                     if current_count > last_count:
@@ -160,7 +182,8 @@ class ExpediaPlaywrightCollector(BaseCollector):
                 self.log(log_callback, "If Chromium failed to start on Linux, run: python -m playwright install --with-deps chromium")
                 raise
             finally:
-                safe_close_browser(browser=browser, page=page, log=log_callback)
+                safe_close_browser(browser=browser, context=context, page=page, log=log_callback)
+                self.log(log_callback, "Expedia browser closed.")
 
         self.progress(progress_callback, 1.0, "Expedia collection complete")
         return results

@@ -16,7 +16,14 @@ from playwright.sync_api import sync_playwright
 from collectors.base import BaseCollector, CollectorOptions, LogCallback, ProgressCallback
 from services.date_utils import calculate_checkout_date, format_timestamp_for_filename
 from services.normalizer import clean_hotel_name, is_probable_hotel, parse_price_to_decimal, parse_star_rating, property_type_guess
-from services.playwright_safe import safe_close_browser, safe_page_title, safe_page_url, safe_screenshot
+from services.playwright_safe import (
+    interruptible_page_wait,
+    launch_managed_chromium_context,
+    safe_close_browser,
+    safe_page_title,
+    safe_page_url,
+    safe_screenshot,
+)
 from services.scraper_errors import AccessRestrictionError, BrowserClosedError, is_browser_closed_error
 
 
@@ -311,6 +318,8 @@ class BookingPlaywrightCollector(BaseCollector):
             self._write_json_safely(headless_startup_path, headless_startup, log_callback=None)
 
         def step(progress_value: float, message: str, **updates):
+            if self.should_stop(options):
+                raise RuntimeError(f"stopped_by_user: cancelled during {message}")
             self.progress(progress_callback, progress_value, message)
             self._notify_status(
                 options,
@@ -391,29 +400,37 @@ class BookingPlaywrightCollector(BaseCollector):
                 "hotels_removed_by_star_filter": 0,
                 "hotels_kept_after_star_filter": 0,
                 "error_message": None,
+                "page_loaded": False,
+                "search_verified": False,
+                "sort_applied": False,
+                "hotel_cards_detected": 0,
             }
         )
 
         self.log(log_callback, "Browser launched: starting Booking.com Chromium session.")
         step(0.03, "browser launched")
 
-        launch_args = ["--disable-dev-shm-usage"]
+        launch_args = ["--disable-dev-shm-usage", "--disable-background-networking"]
         with sync_playwright() as playwright:
             browser_start = time.perf_counter()
             browser = None
+            context = None
+            page = None
             try:
                 if options.browser_profile_dir:
-                    options.browser_profile_dir.mkdir(parents=True, exist_ok=True)
                     self.log(log_callback, f"Using isolated Playwright profile: {options.browser_profile_dir.resolve()}")
-                    context = playwright.chromium.launch_persistent_context(
-                        user_data_dir=str(options.browser_profile_dir),
-                        headless=options.headless,
-                        args=launch_args,
-                        viewport={"width": 1366, "height": 900},
-                    )
-                else:
-                    browser = playwright.chromium.launch(headless=options.headless, args=launch_args)
-                    context = browser.new_context(viewport={"width": 1366, "height": 900})
+                browser, context, implementation = launch_managed_chromium_context(
+                    playwright,
+                    headless=options.headless,
+                    profile_dir=options.browser_profile_dir,
+                    args=launch_args,
+                    viewport={"width": 1366, "height": 900},
+                    log=log_callback,
+                )
+                options.stats["browser_implementation"] = implementation
+                context.set_default_timeout(15000)
+                context.set_default_navigation_timeout(45000)
+                self.log(log_callback, "Playwright context ready with 15s selector timeout and 45s navigation timeout.")
                 update_headless_startup(browser_launched="yes")
             except Exception as exc:
                 error_message = str(exc)
@@ -444,8 +461,10 @@ class BookingPlaywrightCollector(BaseCollector):
             try:
                 page_load_start = time.perf_counter()
                 page.goto("https://www.booking.com/", wait_until="domcontentloaded", timeout=45000)
-                page.wait_for_timeout(1000 if options.fast_mode else 2500)
+                if not interruptible_page_wait(page, 1000 if options.fast_mode else 2500, options.stop_event):
+                    raise RuntimeError("stopped_by_user: cancelled during initial page load")
                 options.stats["page_load_time_seconds"] = round(float(options.stats.get("page_load_time_seconds", 0)) + (time.perf_counter() - page_load_start), 2)
+                options.stats["page_loaded"] = True
                 self.log(log_callback, "Booking.com homepage opened")
                 self.log(log_callback, f"Final URL after redirect: {safe_page_url(page, log_callback)}")
                 self.log(log_callback, f"Page title: {safe_page_title(page, log_callback)}")
@@ -479,7 +498,8 @@ class BookingPlaywrightCollector(BaseCollector):
                 if not homepage_search_applied:
                     self.log(log_callback, "Fallback direct URL used.")
                     page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
-                    page.wait_for_timeout(1000 if options.fast_mode else 2500)
+                    if not interruptible_page_wait(page, 1000 if options.fast_mode else 2500, options.stop_event):
+                        raise RuntimeError("stopped_by_user: cancelled during search navigation")
                 step(0.20, "search clicked", latest_url=page.url)
 
                 self._wait_for_results_page(page, log_callback)
@@ -502,7 +522,8 @@ class BookingPlaywrightCollector(BaseCollector):
                         try:
                             self.log(log_callback, f"Direct search retry {retry_index}: {retry_url}")
                             page.goto(retry_url, wait_until="domcontentloaded", timeout=45000)
-                            page.wait_for_timeout(1000 if options.fast_mode else 2500)
+                            if not interruptible_page_wait(page, 1000 if options.fast_mode else 2500, options.stop_event):
+                                raise RuntimeError("stopped_by_user: cancelled during direct search retry")
                             self._wait_for_results_page(page, log_callback)
                             self._ensure_currency(page, currency, options, log_callback)
                             results_url = page.url
@@ -514,6 +535,7 @@ class BookingPlaywrightCollector(BaseCollector):
                             self.log(log_callback, f"Direct search retry {retry_index} did not verify: {retry_exc}")
                     else:
                         raise last_verify_error
+                options.stats["search_verified"] = True
                 self._apply_price_sort(page, search_url, screenshot_dir, options, screenshot_paths, log_callback)
                 results_url = page.url
                 self._screenshot(page, screenshot_dir, "booking_after_sort", options, screenshot_paths, log_callback)
@@ -539,6 +561,7 @@ class BookingPlaywrightCollector(BaseCollector):
                     return []
 
                 card_count_before = self._valid_card_count(page, selector)
+                options.stats["hotel_cards_detected"] = card_count_before
                 self.log(log_callback, f"Hotel card count before scrolling: {card_count_before}")
                 self._screenshot(page, screenshot_dir, "booking_first_cards", options, screenshot_paths, log_callback)
                 step(0.42, "hotel cards detected", visible_card_count=card_count_before, current_hotel_card_count=card_count_before)
@@ -634,6 +657,13 @@ class BookingPlaywrightCollector(BaseCollector):
                 error_message = str(exc)
                 tb = traceback.format_exc()
                 options.stats["error_message"] = error_message
+                cancelled = self.should_stop(options) or "stopped_by_user" in error_message
+                if cancelled:
+                    options.stats["final_stop_reason"] = "stopped_user_requested"
+                    options.stats["completion_status"] = "stopped_by_user"
+                    self._notify_status(options, "Stop requested; closing Booking.com browser.", status="stopping")
+                    self.log(log_callback, "User cancellation received; skipping error diagnostics and closing the browser.")
+                    raise
                 if not options.stats.get("final_stop_reason"):
                     options.stats["final_stop_reason"] = (
                         "blocked_or_access_restricted"
@@ -1157,7 +1187,10 @@ class BookingPlaywrightCollector(BaseCollector):
         params.update(self._date_part_params("checkin", checkin_date))
         params.update(self._date_part_params("checkout", checkout_date))
         alternate_url = f"https://www.booking.com/searchresults.html?{urlencode(params)}"
-        candidates = [original_url, alternate_url]
+        # Prefer the explicit searchresults URL. Headless Booking sessions have
+        # repeatedly canonicalized the form result to a city landing page that
+        # contains neither the requested dates nor result cards.
+        candidates = [alternate_url, original_url]
         unique: list[str] = []
         for url in candidates:
             if url not in unique:
@@ -1284,6 +1317,7 @@ class BookingPlaywrightCollector(BaseCollector):
             self.log(log_callback, f"first visible prices after sorting: {self._first_visible_prices(page)}")
         else:
             self.log(log_callback, "Warning: price low to high sorting could not be applied.")
+        options.stats["sort_applied"] = applied
         self._screenshot(page, screenshot_dir, "booking_sort_applied", options, screenshot_paths, log_callback)
 
     def _url_with_price_sort(self, current_url: str) -> str:
@@ -1710,7 +1744,9 @@ class BookingPlaywrightCollector(BaseCollector):
         after_count = previous_card_count
         logged_button_wait = False
         while time.monotonic() < deadline:
-            page.wait_for_timeout(1000)
+            if not interruptible_page_wait(page, 1000, options.stop_event if options else None):
+                self.log(log_callback, "Stop requested while waiting for cards after Load more.")
+                return False
             after_count = self._best_hotel_card_count(page, selector, log_callback)
             if after_count > previous_card_count:
                 break
@@ -2460,6 +2496,8 @@ class BookingPlaywrightCollector(BaseCollector):
         options: CollectorOptions,
         log_callback: LogCallback | None,
     ) -> Path | None:
+        if not options.screenshots_enabled or options.performance_mode != "debug":
+            return None
         screenshot_dir.mkdir(parents=True, exist_ok=True)
         path = screenshot_dir / f"booking_final_bottom_page_{format_timestamp_for_filename()}.png"
         try:
@@ -3142,29 +3180,17 @@ class BookingPlaywrightCollector(BaseCollector):
             self.log(log_callback, f"Could not write Load more stuck debug text: {exc}")
 
     def _screenshot(self, page, screenshot_dir: Path, prefix: str, options: CollectorOptions, screenshot_paths: list[Path], log_callback: LogCallback | None) -> None:
-        if not options.screenshots_enabled:
-            return
         prefix_lower = prefix.lower()
-        headless_mandatory = options.headless and any(
-            token in prefix_lower
-            for token in [
-                "after_homepage_open",
-                "after_cookie",
-                "after_search_results_load",
-                "after_sort",
-                "first_cards",
-                "final_scroll",
-                "error",
-                "zero",
-                "access",
-            ]
-        )
-        if options.performance_mode == "fast" and not any(token in prefix_lower for token in ["error", "zero", "access", "stuck", "failed"]) and not headless_mandatory:
+        diagnostic = any(token in prefix_lower for token in ["error", "zero", "access", "captcha", "stuck", "failed"])
+        if not options.screenshots_enabled and not diagnostic:
             return
-        if options.performance_mode == "balanced" and not any(
-            token in prefix_lower
-            for token in ["after_search_results_load", "final_scroll", "error", "zero", "access", "stuck", "failed"]
-        ) and not headless_mandatory:
+        if options.performance_mode != "debug" and not diagnostic:
+            return
+        limit = max(1, int(options.stats.get("screenshot_limit", 12)))
+        if len(screenshot_paths) >= limit:
+            if not options.stats.get("screenshot_limit_logged"):
+                options.stats["screenshot_limit_logged"] = True
+                self.log(log_callback, f"Screenshot limit reached ({limit}) for this date; further screenshots skipped.")
             return
         path = screenshot_dir / f"{prefix}_{format_timestamp_for_filename()}.png"
         try:
