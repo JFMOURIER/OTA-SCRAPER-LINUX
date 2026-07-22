@@ -35,6 +35,8 @@ SQLITE_COLLECTION_RUN_FIELDS = [
     "status",
     "selected_star_ratings",
     "include_unknown_star_rating",
+    "job_signature",
+    "job_signature_hash",
 ]
 
 
@@ -64,6 +66,8 @@ def create_collection_run(
     status: str = "running",
     selected_star_ratings: str | None = None,
     include_unknown_star_rating: bool = True,
+    job_signature: str | None = None,
+    job_signature_hash: str | None = None,
     backend: str | None = None,
 ) -> int:
     if normalize_backend(backend) == "postgres":
@@ -79,6 +83,7 @@ def create_collection_run(
             status,
             selected_star_ratings,
             include_unknown_star_rating,
+            job_signature, job_signature_hash,
         )
     return _create_collection_run_sqlite(
         source,
@@ -92,6 +97,7 @@ def create_collection_run(
         status,
         selected_star_ratings,
         include_unknown_star_rating,
+        job_signature, job_signature_hash,
     )
 
 
@@ -262,6 +268,8 @@ def _init_sqlite() -> None:
                 excel_file_path text,
                 selected_star_ratings text,
                 include_unknown_star_rating integer
+                ,job_signature text
+                ,job_signature_hash text
             );
 
             create table if not exists hotel_price_results (
@@ -326,6 +334,8 @@ def _ensure_sqlite_columns(conn: sqlite3.Connection) -> None:
     additions = {
         "selected_star_ratings": "text",
         "include_unknown_star_rating": "integer",
+        "job_signature": "text",
+        "job_signature_hash": "text",
     }
     for column, column_type in additions.items():
         if column not in existing:
@@ -405,6 +415,8 @@ def _create_collection_run_sqlite(
     status: str,
     selected_star_ratings: str | None,
     include_unknown_star_rating: bool,
+    job_signature: str | None = None,
+    job_signature_hash: str | None = None,
 ) -> int:
     values = {
         "source": source,
@@ -419,6 +431,8 @@ def _create_collection_run_sqlite(
         "status": status,
         "selected_star_ratings": selected_star_ratings,
         "include_unknown_star_rating": include_unknown_star_rating,
+        "job_signature": job_signature,
+        "job_signature_hash": job_signature_hash,
     }
     columns = ", ".join(SQLITE_COLLECTION_RUN_FIELDS)
     placeholders = ", ".join(["?"] * len(SQLITE_COLLECTION_RUN_FIELDS))
@@ -443,13 +457,15 @@ def _create_collection_run_postgres(
     status: str,
     selected_star_ratings: str | None,
     include_unknown_star_rating: bool,
+    job_signature: str | None = None,
+    job_signature_hash: str | None = None,
 ) -> int:
     sql = """
         insert into collection_runs (
             source, city_or_region, checkin_date, checkout_date, number_of_nights,
-            adults, currency, max_hotels, status, selected_star_ratings, include_unknown_star_rating
+            adults, currency, max_hotels, status, selected_star_ratings, include_unknown_star_rating, job_signature, job_signature_hash
         )
-        values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         returning id
     """
     with get_connection() as conn:
@@ -468,6 +484,8 @@ def _create_collection_run_postgres(
                     status,
                     selected_star_ratings,
                     include_unknown_star_rating,
+                    job_signature,
+                    job_signature_hash,
                 ),
             )
             run_id = cur.fetchone()[0]

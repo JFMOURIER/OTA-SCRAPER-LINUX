@@ -17,6 +17,7 @@ from typing import Any
 from uuid import uuid4
 
 import os
+import hashlib
 import pandas as pd
 import streamlit as st
 from dotenv import dotenv_values, load_dotenv
@@ -1532,8 +1533,13 @@ def validate_collector_options(config: CollectionConfig, stop_event: Event | Non
 
 
 def matching_saved_run_id(config: CollectionConfig) -> int | None:
+    target_hash = job_signature_hash(config)
     target_checkout = calculate_checkout_date(config.checkin_end, config.nights).isoformat()
     for run in fetch_collection_runs(limit=200, backend=config.db_backend):
+        if str(run.get("status") or "") in {"completed_all_dates", "completed", "no_work_already_completed"}:
+            continue
+        if target_hash and str(run.get("job_signature_hash") or "") != target_hash:
+            continue
         if str(run.get("source") or "") != config.source:
             continue
         if str(run.get("city_or_region") or "").strip().lower() != config.city_or_region.strip().lower():
@@ -1546,6 +1552,11 @@ def matching_saved_run_id(config: CollectionConfig) -> int | None:
             continue
         return int(run["id"])
     return None
+
+def job_signature(config: CollectionConfig) -> dict[str, Any]:
+    return {"source":config.source,"city":config.city_or_region.strip().lower(),"start":config.checkin_start.isoformat(),"end":config.checkin_end.isoformat(),"nights":config.nights,"adults":config.adults,"currency":config.currency,"max_hotels":config.max_hotels,"stars":list(config.selected_star_ratings),"unknown_stars":config.include_unknown_star_rating,"hotels_only":config.hotels_only,"collect_all":config.collect_all_available,"performance":config.performance_mode,"headless":config.headless}
+def job_signature_hash(config: CollectionConfig) -> str:
+    return hashlib.sha256(json.dumps(job_signature(config),sort_keys=True,separators=(",",":")).encode()).hexdigest()
 
 
 def saved_date_counts(results: list[dict[str, Any]]) -> dict[str, int]:
@@ -1667,6 +1678,8 @@ def run_collection_job(config: CollectionConfig, stop_event: Event, queue: Queue
                 0 if config.collect_all_available else config.max_hotels,
                 selected_star_ratings=",".join(str(value) for value in config.selected_star_ratings),
                 include_unknown_star_rating=config.include_unknown_star_rating,
+                job_signature=json.dumps(job_signature(config), sort_keys=True),
+                job_signature_hash=job_signature_hash(config),
                 backend=config.db_backend,
             )
             checkpoint_payload = {
@@ -3591,7 +3604,7 @@ def main() -> None:
         )
         max_parallel_workers = 1
         st.warning("Parallel scraper workers are disabled by the host-wide safety lock.")
-        resume_previous_run = st.checkbox("Resume incomplete batch", value=True)
+        resume_previous_run = st.checkbox("Resume interrupted run (explicit)", value=False)
         st.header("Reliability")
         retry_failed_dates_automatically = st.checkbox("Retry failed dates automatically", value=True)
         max_retries_per_date = int(st.selectbox("Max retries per date", [1, 2, 3, 5], index=2))
