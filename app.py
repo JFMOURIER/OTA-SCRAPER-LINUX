@@ -2352,8 +2352,6 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
         save_checkpoint(checkpoint)
         push_date_rows(checkpoint)
 
-        collector = get_collector(config.source)
-
         for date_index, stay_date in enumerate(planned_dates, start=1):
             date_key = stay_date.isoformat()
             checkout_date = calculate_checkout_date(stay_date, config.nights)
@@ -2406,6 +2404,9 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
                     log("Stop requested. Saving current state before stopping.")
                     break
                 log(f"Attempt {attempt} of {max_attempts} for {date_key}")
+                # Collector instances own Playwright state. Recreate them for
+                # every date/retry so Chromium cannot grow across long runs.
+                collector = get_collector(config.source)
                 update_heartbeat(
                     HEARTBEAT_FILE,
                     job_id=getattr(queue, "job_id", None),
@@ -2637,11 +2638,13 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
         if run_id is not None:
             if normalized_results and status != "fatal_config_error":
                 summary = build_summary(status)
-                if config.db_backend == "sqlite":
-                    excel_path = export_sqlite_run_to_excel(run_id, summary, EXPORT_DIR, filename="partial_current_run.xlsx")
-                else:
-                    excel_path = export_results_to_excel(normalized_results, summary, EXPORT_DIR, filename="partial_current_run.xlsx")
-                update_collection_run_excel_path(run_id, str(excel_path), backend=config.db_backend)
+                excel_path = None
+                if os.getenv("OTA_EXPORT_EXCEL_ON_ERROR", "0").lower() in {"1", "true", "yes"}:
+                    if config.db_backend == "sqlite":
+                        excel_path = export_sqlite_run_to_excel(run_id, summary, EXPORT_DIR, filename="partial_current_run.xlsx")
+                    else:
+                        excel_path = export_results_to_excel(normalized_results, summary, EXPORT_DIR, filename="partial_current_run.xlsx")
+                    update_collection_run_excel_path(run_id, str(excel_path), backend=config.db_backend)
                 csv_payload = export_final_csv(
                     normalized_results,
                     summary,
@@ -2649,7 +2652,7 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
                     log_callback=log,
                     stream_sqlite_run_id=run_id if config.db_backend == "sqlite" else None,
                 )
-                queue.put(("complete", {"results": normalized_results, "summary": summary, "excel_file_path": str(excel_path), "status": status, **csv_payload}))
+                queue.put(("complete", {"results": normalized_results, "summary": summary, "excel_file_path": str(excel_path) if excel_path else None, "status": status, **csv_payload}))
             elif status != "fatal_config_error":
                 summary = build_summary(status)
                 csv_payload = export_final_csv([], summary, session_id=run_id, log_callback=log)
