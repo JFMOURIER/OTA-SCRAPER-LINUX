@@ -2338,6 +2338,10 @@ class BookingPlaywrightCollector(BaseCollector):
                 results_url=results_url,
             )
         start = time.monotonic()
+        # Inactivity is measured from the start of this date's loading phase;
+        # initialize before the first loop read (including zero-card pages and
+        # every retry/new collector instance).
+        last_growth = start
         max_seconds = max(1, int(max_scroll_minutes)) * 60
         max_unchanged = 2
         delay_ms = 450 if options.performance_mode == "fast" else 800 if options.performance_mode == "balanced" else 1500
