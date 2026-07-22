@@ -2204,12 +2204,10 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
                         )
                     )
                 if persistable:
-                    with _db_write_lock_for(config):
-                        insert_hotel_results(persistable, backend=config.db_backend)
-                    saved_count = count_results_by_run_id(run_id, backend=config.db_backend)
-                    retain_recent(persistable)
-                    queue.put(("records_saved", saved_count))
-                    log(f"Incremental SQLite checkpoint: {len(persistable)} newly discovered hotels for {stay_date.isoformat()}.")
+                    # Partial discovery is checkpoint state, not authoritative
+                    # results. Keep it in the per-date JSON/CSV files; inserting
+                    # it into hotel_price_results caused partial+final duplicates.
+                    log(f"Incremental checkpoint: {len(persistable)} records written to partial files for {stay_date.isoformat()} (not final SQLite rows).")
             options.stats["partial_json_path"] = paths["json"]
             options.stats["partial_csv_path"] = paths["csv"]
             options.stats["partial_records_saved"] = paths["records"]
@@ -2460,7 +2458,7 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
                         checkpoint,
                         stay_date=stay_date,
                         checkout_date=checkout_date,
-                        status="completed" if date_results else "completed_partial",
+                        status=("completed_target_reached" if options.stats.get("final_stop_reason") == "completed_max_hotels_reached" else "completed_results_exhausted" if options.stats.get("completion_status") == "completed_results_exhausted" else "completed" if date_results else "completed_partial"),
                         attempts=attempt,
                         records_collected=len(date_results),
                         output_files=output_files,
@@ -2869,7 +2867,7 @@ def run_batch_collection_job(config: CollectionConfig, stop_event: Event, queue:
                 if not is_booking_source(config.source):
                     raw_results = filter_results_by_star_rating(raw_results, options, queue)
                 date_results = [normalize_hotel_result({**row, "collection_run_id": run_id}) for row in raw_results]
-                normalized_results.extend(date_results)
+                retain_recent(date_results)
                 with _db_write_lock_for(config):
                     saved_count += insert_hotel_results(date_results, backend=config.db_backend)
                 update_block(

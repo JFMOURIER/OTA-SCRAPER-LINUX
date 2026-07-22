@@ -1937,6 +1937,7 @@ class BookingPlaywrightCollector(BaseCollector):
         screenshot_dir = screenshot_dir or Path("data/screenshots")
         screenshot_paths = screenshot_paths if screenshot_paths is not None else []
         start = time.monotonic()
+        last_growth = start
         max_seconds = max(1, int(max_scroll_minutes)) * 60
         unique_results_by_key: dict[str, dict] = {}
 
@@ -2348,11 +2349,13 @@ class BookingPlaywrightCollector(BaseCollector):
                 self.log(log_callback, f"Reached maximum hotels setting ({max_hotels}); stopping scroll.")
                 options.stats["final_stop_reason"] = "completed_max_hotels_reached"
                 break
-            elapsed = time.monotonic() - start
-            if elapsed >= max_seconds:
+            elapsed = time.monotonic() - last_growth
+            hard_elapsed = time.monotonic() - start
+            if elapsed >= max_seconds or hard_elapsed >= max_seconds * 4:
                 options.stats["maximum_scroll_time_reached"] = True
-                options.stats["final_stop_reason"] = "stopped_max_scroll_time_reached"
-                self.log(log_callback, f"Maximum scroll time reached ({max_scroll_minutes} minutes); stopping scroll.")
+                options.stats["final_stop_reason"] = "completed_scroll_time_limit"
+                options.stats["stopped_by_time_limit"] = True
+                self.log(log_callback, f"Scroll inactivity/hard limit reached ({max_scroll_minutes} minutes inactivity); stopping scroll.")
                 break
             if self._detect_access_restriction(page, log_callback):
                 options.stats["final_stop_reason"] = "blocked_or_access_restricted"
@@ -2397,6 +2400,7 @@ class BookingPlaywrightCollector(BaseCollector):
             cycle_added = cycle_added_before_click + cycle_added_after_click
             if current_count > last_count or cycle_added > 0:
                 last_count = current_count
+                last_growth = time.monotonic()
                 options.stats["consecutive_no_new_card_attempts"] = 0
             else:
                 options.stats["consecutive_no_new_card_attempts"] = int(options.stats.get("consecutive_no_new_card_attempts", 0)) + 1
@@ -2417,6 +2421,9 @@ class BookingPlaywrightCollector(BaseCollector):
 
         if not options.stats.get("final_stop_reason"):
             options.stats["final_stop_reason"] = "completed_no_more_load_more_button"
+        options.stats["requested_max_hotels"] = int(max_hotels)
+        options.stats["available_cards"] = int(last_count)
+        options.stats["results_exhausted"] = options.stats.get("final_stop_reason") in {"completed_no_more_load_more_button", "completed_results_exhausted"}
         if str(options.stats.get("final_stop_reason", "")).startswith("completed") and options.stats.get("unique_hotels_collected", 0) < int(max_hotels):
             options.stats["completion_status"] = "completed_results_exhausted"
             self.log(log_callback, f"Results exhausted: requested up to {max_hotels}, Booking.com exposed {last_count} cards, {options.stats.get('unique_hotels_collected', 0)} valid hotels retained.")
