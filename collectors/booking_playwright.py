@@ -1653,7 +1653,7 @@ class BookingPlaywrightCollector(BaseCollector):
         try:
             self.log(log_callback, "Scrolling Load more results button into view.")
             button.scroll_into_view_if_needed(timeout=5000)
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(100)
             visible = button.is_visible(timeout=1000)
             enabled = button.is_enabled(timeout=1000)
             try:
@@ -1686,7 +1686,7 @@ class BookingPlaywrightCollector(BaseCollector):
                 options.stats["load_more_last_button_text"] = found.get("text")
                 options.stats["load_more_last_button_strategy"] = found.get("strategy")
                 button.scroll_into_view_if_needed(timeout=5000)
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(100)
                 retry_visible = button.is_visible(timeout=1000)
                 retry_enabled = button.is_enabled(timeout=1000)
                 try:
@@ -1716,7 +1716,7 @@ class BookingPlaywrightCollector(BaseCollector):
                 return False
 
         try:
-            page.wait_for_load_state("networkidle", timeout=6000)
+            page.wait_for_load_state("networkidle", timeout=1500)
         except PlaywrightTimeoutError:
             self.log(log_callback, "Network idle wait after Load more timed out; continuing with card-count wait.")
         self._ensure_results_page(page, results_url, options, log_callback)
@@ -1739,22 +1739,30 @@ class BookingPlaywrightCollector(BaseCollector):
         options: CollectorOptions | None = None,
     ) -> bool:
         self.log(log_callback, "Waiting for new cards.")
-        wait_seconds = 30 if not options or options.ultra_reliable_loading_mode else 24
+        wait_seconds = 15 if not options or options.ultra_reliable_loading_mode else 12
         deadline = time.monotonic() + wait_seconds
         after_count = previous_card_count
         logged_button_wait = False
         while time.monotonic() < deadline:
-            if not interruptible_page_wait(page, 1000, options.stop_event if options else None):
+            if not interruptible_page_wait(page, 300, options.stop_event if options else None):
                 self.log(log_callback, "Stop requested while waiting for cards after Load more.")
                 return False
             after_count = self._best_hotel_card_count(page, selector, log_callback)
             if after_count > previous_card_count:
                 break
-            if self.find_load_more_button(page, None) is None and after_count == previous_card_count:
+            button_state = self.find_load_more_button(page, None)
+            if button_state is None and after_count == previous_card_count:
                 if not logged_button_wait:
                     self.log(log_callback, "Load more button disappeared; waiting for new hotel cards to render.")
-                    logged_button_wait = True
+                logged_button_wait = True
                 continue
+            if button_state is not None and after_count == previous_card_count:
+                try:
+                    if not button_state["button"].is_enabled(timeout=200):
+                        self.log(log_callback, "Load more became disabled without adding cards; results exhausted.")
+                        break
+                except PlaywrightError:
+                    pass
 
         new_cards = max(after_count - previous_card_count, 0)
         self.log(log_callback, f"Hotel cards after Load more: {after_count}.")
@@ -2321,7 +2329,7 @@ class BookingPlaywrightCollector(BaseCollector):
             )
         start = time.monotonic()
         max_seconds = max(1, int(max_scroll_minutes)) * 60
-        max_unchanged = 5
+        max_unchanged = 2
         delay_ms = 450 if options.performance_mode == "fast" else 800 if options.performance_mode == "balanced" else 1500
         current_count = self._best_hotel_card_count(page, selector, log_callback)
         last_count = current_count
@@ -2409,6 +2417,9 @@ class BookingPlaywrightCollector(BaseCollector):
 
         if not options.stats.get("final_stop_reason"):
             options.stats["final_stop_reason"] = "completed_no_more_load_more_button"
+        if str(options.stats.get("final_stop_reason", "")).startswith("completed") and options.stats.get("unique_hotels_collected", 0) < int(max_hotels):
+            options.stats["completion_status"] = "completed_results_exhausted"
+            self.log(log_callback, f"Results exhausted: requested up to {max_hotels}, Booking.com exposed {last_count} cards, {options.stats.get('unique_hotels_collected', 0)} valid hotels retained.")
         try:
             options.stats["final_page_height"] = int(page.evaluate("document.body.scrollHeight"))
             options.stats["final_url"] = safe_page_url(page, log_callback)
