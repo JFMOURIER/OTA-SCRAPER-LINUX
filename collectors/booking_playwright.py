@@ -282,7 +282,7 @@ class BookingPlaywrightCollector(BaseCollector):
         debug_dir = options.debug_dir or Path("data/debug")
         screenshot_dir.mkdir(parents=True, exist_ok=True)
         debug_dir.mkdir(parents=True, exist_ok=True)
-        browser_mode_label = "Headless reliable mode" if options.headless else "Visible debug mode"
+        browser_mode_label = "Headless experimental mode" if options.headless else "Visible production mode"
         self.log(log_callback, f"Browser mode selected: {browser_mode_label}")
         self.log(log_callback, f"Launching Chromium with headless={options.headless}")
         results: list[dict] = []
@@ -1628,7 +1628,8 @@ class BookingPlaywrightCollector(BaseCollector):
 
         self.log(log_callback, "Genius popup checked before Load more.")
         popup_visible = self._genius_popup_visible(page)
-        self.handle_booking_popups(page, log_callback, options)
+        if popup_visible:
+            self.handle_booking_popups(page, log_callback, options)
         if popup_visible:
             self.log(log_callback, "Genius popup closed before Load more.")
 
@@ -1682,8 +1683,10 @@ class BookingPlaywrightCollector(BaseCollector):
             self.log(log_callback, f"Normal Load more click failed: {exc}")
             self._force_screenshot(page, screenshot_dir, "load_more_click_failed", screenshot_paths, options, log_callback)
             self.log(log_callback, "Retrying after cookie and popup handling.")
-            self.handle_booking_cookie_banner(page, log_callback, options)
-            self.handle_booking_popups(page, log_callback, options)
+            if self._cookie_banner_visible(page):
+                self.handle_booking_cookie_banner(page, log_callback, options)
+            if self._genius_popup_visible(page):
+                self.handle_booking_popups(page, log_callback, options)
             found = self.find_load_more_button(page, log_callback)
             try:
                 if found is None:

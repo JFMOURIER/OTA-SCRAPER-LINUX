@@ -3554,10 +3554,10 @@ def main() -> None:
         performance_mode = "debug" if performance_label.startswith("Debug") else "balanced"
         browser_mode = st.radio(
             "Browser mode",
-            ["Visible debug mode", "Headless reliable mode"],
-            index=1 if performance_mode == "balanced" else 0,
+            ["Visible Booking browser recommended", "Headless experimental"],
+            index=0,
         )
-        headless = browser_mode == "Headless reliable mode"
+        headless = browser_mode == "Headless experimental"
         debug_mode = performance_mode == "debug"
         fast_mode = False
         screenshots_enabled = debug_mode
@@ -3569,7 +3569,7 @@ def main() -> None:
         else:
             st.caption("Fast mode is temporarily ignored while Booking.com complete collection is stabilized.")
         if is_booking_source(source) and headless:
-            st.info("Headless reliable mode uses the same Booking.com scraper logic as visible mode, launched with headless=True.")
+            st.info("Headless mode is experimental on this machine; visible Booking browser mode is recommended for production.")
         smoke_clicked = st.button("Run headless smoke test", use_container_width=True, disabled=job_active)
         test_mode = st.checkbox("Test mode", value=False)
         auto_refresh = st.checkbox("Auto refresh while running", value=True)
