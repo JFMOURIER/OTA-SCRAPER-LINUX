@@ -13,7 +13,7 @@ STATUS_DIR="$DATA_DIR/status"
 LOG_DIR="$DATA_DIR/logs"
 PID_FILE="$STATUS_DIR/streamlit.pid"
 CURRENT_LOG_FILE="$STATUS_DIR/streamlit_current_log.txt"
-UNIT_NAME="ota-ui.service"
+UNIT_NAME="${OTA_UI_UNIT:-ota-ui.service}"
 
 mkdir -p "$STATUS_DIR" "$LOG_DIR"
 

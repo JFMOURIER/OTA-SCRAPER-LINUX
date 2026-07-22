@@ -1,0 +1,27 @@
+[Unit]
+Description=OTA Scraper Streamlit interface instance %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jf/Projects/OTA-SCRAPER-LINUX
+Environment=INSTANCE_ID=instance_%i
+Environment="INSTANCE_NAME=Instance %i"
+Environment=INSTANCE_PORT=850%i
+Environment=INSTANCE_DATA_DIR=data/instances/instance_%i
+Environment=DB_BACKEND=sqlite
+Environment=OTA_UI_UNIT=ota-ui@%i.service
+ExecStart=/home/jf/Projects/OTA-SCRAPER-LINUX/scripts/ota-ui serve
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=25
+KillMode=control-group
+MemoryAccounting=yes
+CPUAccounting=yes
+TasksAccounting=yes
+TasksMax=256
+Nice=10
+
+[Install]
+WantedBy=default.target

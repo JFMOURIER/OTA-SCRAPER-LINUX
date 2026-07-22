@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+unit_for(){ echo "ota-ui@$1.service"; }
+valid(){ [[ "$1" =~ ^[1-4]$ ]] || { echo "instance must be 1-4" >&2; exit 2; }; }
+install_units(){ mkdir -p "$HOME/.config/systemd/user"; install -m 0644 "$ROOT/systemd/ota-ui@.service" "$HOME/.config/systemd/user/ota-ui@.service"; systemctl --user daemon-reload; }
+case "${1:-status}" in
+ start) valid "${2:-}"; install_units; systemctl --user start "$(unit_for "$2")"; echo "started instance $2 on port 850$2";;
+ stop) valid "${2:-}"; systemctl --user stop "$(unit_for "$2")" || true; echo "stopped instance $2";;
+ restart) valid "${2:-}"; install_units; systemctl --user restart "$(unit_for "$2")"; echo "restarted instance $2";;
+ status) for i in 1 2 3 4; do systemctl --user is-active "$(unit_for "$i")" 2>/dev/null || true; ss -ltn "sport = :850$i" 2>/dev/null | tail -n +2; done;;
+ logs) valid "${2:-}"; journalctl --user -u "$(unit_for "$2")" -n "${OTA_LOG_LINES:-120}" --no-pager;;
+ start-all) install_units; for i in 1 2 3 4; do systemctl --user start "$(unit_for "$i")"; sleep 2; done; echo "started four interfaces";;
+ stop-all) for i in 1 2 3 4; do systemctl --user stop "$(unit_for "$i")" || true; done; echo "stopped four interfaces";;
+ test-four) exec "$ROOT/.venv/bin/python" "$ROOT/tools/four_way_smoke.py";;
+ *) echo "Usage: scripts/ota-instances {start|stop|restart|status|logs} N | start-all | stop-all | test-four"; exit 2;;
+esac

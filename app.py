@@ -109,7 +109,8 @@ HEARTBEAT_FILE = STATUS_DIR / "heartbeat.json"
 ENV_PATH = BASE_DIR / ".env"
 SQLITE_WRITE_LOCK = Lock()
 ACTIVE_STATUS_STALE_AFTER_SECONDS = 120
-SCRAPER_LOCK_FILE = BASE_DIR / "data" / "active_scraper.lock"
+# Lock is per instance; the legacy global lock is intentionally left untouched.
+SCRAPER_LOCK_FILE = INSTANCE_CONFIG.data_dir / "status" / "active_scraper.lock"
 CANCEL_FILE = STATUS_DIR / "cancel_request.json"
 WORKER_STOP_GRACE_SECONDS = 8.0
 MAX_UI_RESULTS = 500
