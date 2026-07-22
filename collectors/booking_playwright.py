@@ -1498,6 +1498,12 @@ class BookingPlaywrightCollector(BaseCollector):
         return len(self._valid_cards(page, selector))
 
     def _best_hotel_card_count(self, page, selector: str | None = None, log_callback: LogCallback | None = None) -> int:
+        if selector:
+            try:
+                return self._valid_card_count(page, selector)
+            except PlaywrightError as exc:
+                self.log(log_callback, f"Selected hotel card selector failed: {exc}")
+                return 0
         counts: dict[str, int] = {}
         selectors = [selector] if selector else []
         selectors.extend(item for item in self.CARD_SELECTORS if item not in selectors)
