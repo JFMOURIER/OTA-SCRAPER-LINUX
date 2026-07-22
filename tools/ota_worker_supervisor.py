@@ -19,6 +19,14 @@ def main():
     signal.signal(signal.SIGTERM,stop); signal.signal(signal.SIGINT,stop)
     try:
         while not stopping:
+            if req.exists():
+                try: payload=json.loads(req.read_text()); req.unlink()
+                except Exception: payload={}
+                if payload.get('action')=='stop' and child and child.poll() is None:
+                    child.terminate(); (status/'worker_status.json').write_text(json.dumps({'request_id':payload.get('request_id'),'status':'stopping'}))
+                elif payload.get('action')=='start':
+                    (status/'worker_status.json').write_text(json.dumps({'request_id':payload.get('request_id'),'status':'acknowledged'}))
+                    req.write_text(json.dumps(payload))
             if child is None or child.poll() is not None:
                 if child is not None and child.returncode not in (0,):
                     now=time.time(); restarts[:]=[x for x in restarts if now-x<3600]

@@ -3153,6 +3153,15 @@ def drain_job_queue() -> None:
 
 def start_background_job(config: CollectionConfig) -> None:
     reset_current_results()
+    if os.getenv("OTA_EXTERNAL_WORKER", "0").lower() in {"1", "true", "yes"}:
+        # The system worker supervisor owns the scraper process. Streamlit only
+        # submits an atomic request and then observes status files.
+        request_id = str(uuid4())
+        payload = {"request_id": request_id, "instance_id": INSTANCE_CONFIG.instance_id, "action": "start", "timestamp": datetime.now().isoformat(), "source": config.source, "city": config.city_or_region, "start_date": config.checkin_start.isoformat(), "end_date": config.checkin_end.isoformat(), "max_hotels": config.max_hotels, "env": {"INSTANCE_ID": INSTANCE_CONFIG.instance_id, "INSTANCE_DATA_DIR": str(INSTANCE_CONFIG.data_dir), "DB_BACKEND": config.db_backend}}
+        request_path = INSTANCE_CONFIG.status_dir / "worker_request.json"; request_path.parent.mkdir(parents=True, exist_ok=True); tmp = request_path.with_suffix(".tmp"); tmp.write_text(json.dumps(payload, indent=2)); os.replace(tmp, request_path)
+        write_json_file(STATUS_FILE, {"request_id": request_id, "status": "starting", "current_message": "Request submitted to persistent worker", "last_updated_at": datetime.now().isoformat()})
+        st.session_state.current_job = {"id": request_id, "external": True, "worker_pid": None, "queue": None, "stop_event": None}
+        st.session_state.status = "starting"; st.session_state.status_message = f"Request submitted: {request_id}"; return
     context = multiprocessing.get_context("spawn")
     queue = context.Queue()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -3733,7 +3742,11 @@ def main() -> None:
         clear_clicked = st.button("Clear current dashboard results", use_container_width=True, disabled=job_active)
 
     if stop_clicked and st.session_state.current_job:
-        st.session_state.current_job["stop_event"].set("user")
+        if st.session_state.current_job.get("external"):
+            request_path = INSTANCE_CONFIG.status_dir / "worker_request.json"; tmp = request_path.with_suffix('.tmp')
+            tmp.write_text(json.dumps({"request_id": str(uuid4()), "instance_id": INSTANCE_CONFIG.instance_id, "action": "stop", "timestamp": datetime.now().isoformat()})); os.replace(tmp, request_path)
+        else:
+            st.session_state.current_job["stop_event"].set("user")
         st.session_state.current_job["stop_requested_at"] = time.monotonic()
         st.session_state.status_message = "Stop requested. Saving the current checkpoint and closing the scraper browser."
         st.session_state.status = "stopping"
