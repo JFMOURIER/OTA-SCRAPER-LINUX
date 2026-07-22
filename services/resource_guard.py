@@ -36,6 +36,7 @@ class ResourceThresholds:
     emergency_available_mb: int = 500
     minimum_swap_free_mb: int = 256
     maximum_swap_percent: float = 94.0
+    swap_pressure_available_mb: int = 1200
     warn_python_rss_mb: int = 1600
     stop_python_rss_mb: int = 2400
     warn_browser_rss_mb: int = 1800
@@ -61,6 +62,7 @@ class ResourceThresholds:
             emergency_available_mb=integer("OTA_EMERGENCY_AVAILABLE_MB", 500),
             minimum_swap_free_mb=integer("OTA_MIN_SWAP_FREE_MB", 256),
             maximum_swap_percent=decimal("OTA_MAX_SWAP_PERCENT", 94.0),
+            swap_pressure_available_mb=integer("OTA_SWAP_PRESSURE_AVAILABLE_MB", 1200),
             warn_python_rss_mb=integer("OTA_WARN_PYTHON_RSS_MB", 1600),
             stop_python_rss_mb=integer("OTA_STOP_PYTHON_RSS_MB", 2400),
             warn_browser_rss_mb=integer("OTA_WARN_BROWSER_RSS_MB", 1800),
@@ -141,17 +143,24 @@ def evaluate_snapshot(
 ) -> tuple[str, str]:
     if snapshot.available_ram_mb < thresholds.emergency_available_mb:
         return "emergency", f"available RAM is {snapshot.available_ram_mb:.0f} MB"
-    if snapshot.swap_free_mb < thresholds.minimum_swap_free_mb or snapshot.swap_percent >= thresholds.maximum_swap_percent:
-        return "emergency", f"swap is {snapshot.swap_percent:.1f}% used with {snapshot.swap_free_mb:.0f} MB free"
     if snapshot.disk_free_gb < thresholds.minimum_disk_free_gb:
         return "emergency", f"disk has only {snapshot.disk_free_gb:.2f} GB free"
+    warnings: list[str] = []
+    swap_pressure = snapshot.swap_free_mb < thresholds.minimum_swap_free_mb or snapshot.swap_percent >= thresholds.maximum_swap_percent
+    if swap_pressure:
+        swap_reason = (
+            f"swap is {snapshot.swap_percent:.1f}% used with {snapshot.swap_free_mb:.0f} MB free; "
+            f"available RAM is {snapshot.available_ram_mb:.0f} MB"
+        )
+        if snapshot.available_ram_mb < thresholds.swap_pressure_available_mb:
+            return "emergency", swap_reason
+        warnings.append(swap_reason)
     if starting and snapshot.available_ram_mb < thresholds.minimum_start_available_mb:
         return "stop", f"available RAM is below the {thresholds.minimum_start_available_mb} MB start threshold"
     if snapshot.python_rss_mb >= thresholds.stop_python_rss_mb:
         return "stop", f"worker RSS is {snapshot.python_rss_mb:.0f} MB"
     if snapshot.browser_rss_mb >= thresholds.stop_browser_rss_mb:
         return "stop", f"scraper browser RSS is {snapshot.browser_rss_mb:.0f} MB"
-    warnings: list[str] = []
     if snapshot.python_rss_mb >= thresholds.warn_python_rss_mb:
         warnings.append(f"worker RSS {snapshot.python_rss_mb:.0f} MB")
     if snapshot.browser_rss_mb >= thresholds.warn_browser_rss_mb:

@@ -1487,6 +1487,7 @@ def _collector_summary_metadata(options: CollectorOptions) -> dict[str, Any]:
 
 
 def collector_options_kwargs(config: CollectionConfig, stop_event: Event | None = None, attempt: int = 1) -> dict[str, Any]:
+    low_memory_mode = os.getenv("OTA_LOW_MEMORY_MODE", "1").strip().lower() not in {"0", "false", "no", "off"}
     return {
         "collect_all_available": config.collect_all_available,
         "max_scroll_minutes": config.max_scroll_minutes,
@@ -1497,7 +1498,7 @@ def collector_options_kwargs(config: CollectionConfig, stop_event: Event | None 
         "headless": config.headless,
         "fast_mode": config.fast_mode,
         "performance_mode": config.performance_mode,
-        "block_images_and_fonts": config.block_images_and_fonts,
+        "block_images_and_fonts": bool(config.block_images_and_fonts or (low_memory_mode and config.performance_mode == "balanced" and is_booking_source(config.source))),
         "stop_event": stop_event,
         "hotels_only": config.hotels_only,
         "disable_filters_during_complete_collection": config.disable_filters_during_complete_collection,

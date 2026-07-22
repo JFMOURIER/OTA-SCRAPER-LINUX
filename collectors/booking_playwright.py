@@ -438,7 +438,7 @@ class BookingPlaywrightCollector(BaseCollector):
                 self._write_headless_error(debug_dir, error_message, traceback.format_exc(), log_callback)
                 self.log(log_callback, "Playwright Chromium may not be installed. Run: python -m playwright install --with-deps chromium")
                 raise
-            if options.fast_mode and options.block_images_and_fonts:
+            if options.block_images_and_fonts:
                 self._enable_fast_mode_routes(context, log_callback)
             options.stats["browser_startup_time_seconds"] = round(time.perf_counter() - browser_start, 2)
             page = context.new_page()
@@ -696,16 +696,20 @@ class BookingPlaywrightCollector(BaseCollector):
         return results
 
     def _enable_fast_mode_routes(self, context, log_callback: LogCallback | None) -> None:
-        self.log(log_callback, "Fast mode enabled: blocking images, fonts, and media; JavaScript and XHR remain allowed.")
+        self.log(log_callback, "Low-memory routing enabled: blocking images, fonts, and media; document, JavaScript, fetch, and XHR remain allowed.")
 
         def route_handler(route):
             resource_type = route.request.resource_type
-            if resource_type in {"image", "media", "font"}:
+            if self._should_block_resource_type(resource_type):
                 route.abort()
             else:
                 route.continue_()
 
         context.route("**/*", route_handler)
+
+    @staticmethod
+    def _should_block_resource_type(resource_type: str) -> bool:
+        return resource_type in {"image", "media", "font"}
 
     def _notify_status(self, options: CollectorOptions | None, message: str, **updates) -> None:
         if options is None:

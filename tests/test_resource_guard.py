@@ -4,7 +4,8 @@ import unittest
 import tempfile
 from pathlib import Path
 
-from services.resource_guard import ScraperAlreadyRunning, SingleScraperLock, ResourceSnapshot, ResourceThresholds, evaluate_snapshot
+from unittest.mock import patch
+from services.resource_guard import ResourceGuard, ResourceLimitExceeded, ScraperAlreadyRunning, SingleScraperLock, ResourceSnapshot, ResourceThresholds, evaluate_snapshot
 
 
 def snapshot(**updates):
@@ -37,13 +38,38 @@ class ResourceGuardTests(unittest.TestCase):
         level, _ = evaluate_snapshot(snapshot(available_ram_mb=499), self.thresholds)
         self.assertEqual(level, "emergency")
 
-    def test_emergency_before_swap_exhaustion(self):
-        level, _ = evaluate_snapshot(snapshot(swap_free_mb=200, swap_percent=92), self.thresholds)
+    def test_high_swap_with_safe_available_ram_is_warning(self):
+        level, reason = evaluate_snapshot(snapshot(available_ram_mb=2386.9, swap_used_mb=3876.4, swap_free_mb=219.6, swap_percent=94.6, python_rss_mb=101.9, browser_rss_mb=1885.5), self.thresholds)
+        self.assertEqual(level, "warning")
+        self.assertIn("94.6%", reason)
+        self.assertIn("220 MB free", reason)
+        self.assertIn("2387 MB", reason)
+
+    def test_high_swap_with_low_available_ram_is_emergency(self):
+        level, _ = evaluate_snapshot(snapshot(available_ram_mb=800, swap_free_mb=200, swap_percent=95), self.thresholds)
         self.assertEqual(level, "emergency")
 
     def test_browser_rss_stop(self):
         level, _ = evaluate_snapshot(snapshot(browser_rss_mb=2700), self.thresholds)
         self.assertEqual(level, "stop")
+
+    def test_python_rss_stop(self):
+        level, _ = evaluate_snapshot(snapshot(python_rss_mb=2500), self.thresholds)
+        self.assertEqual(level, "stop")
+
+    def test_low_disk_emergency(self):
+        level, _ = evaluate_snapshot(snapshot(disk_free_gb=4), self.thresholds)
+        self.assertEqual(level, "emergency")
+
+    def test_guard_does_not_raise_warning_but_raises_emergency(self):
+        guard = ResourceGuard(".", thresholds=self.thresholds, minimum_check_interval_seconds=0)
+        safe_swap = snapshot(available_ram_mb=2386.9, swap_free_mb=219.6, swap_percent=94.6)
+        with patch("services.resource_guard.resource_snapshot", return_value=safe_swap):
+            self.assertEqual(guard.check(force=True), safe_swap)
+            self.assertEqual(guard.last_level, "warning")
+        with patch("services.resource_guard.resource_snapshot", return_value=snapshot(available_ram_mb=700, swap_free_mb=200, swap_percent=95)):
+            with self.assertRaises(ResourceLimitExceeded):
+                guard.check(force=True)
 
     def test_normal_snapshot(self):
         level, _ = evaluate_snapshot(snapshot(), self.thresholds)
