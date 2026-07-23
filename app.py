@@ -1589,23 +1589,23 @@ def saved_date_counts(results: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def completed_dates_from_checkpoint_and_db(checkpoint: dict[str, Any], counts: dict[str, int]) -> set[str]:
-    completed = set(str(value) for value in checkpoint.get("completed_dates") or [])
+    completed: set[str] = set()
     date_statuses = checkpoint.get("date_statuses") or {}
     for date_key, count in counts.items():
         row = date_statuses.get(date_key)
-        if isinstance(row, dict):
-            if row.get("status") in {
-                "completed",
-                "completed_partial",
-                "completed_target_reached",
-                "completed_results_exhausted",
-                "completed_resource_safe_limit",
-                "completed_hard_safety_limit",
-                "skipped_resume",
-            } and count > 0:
-                completed.add(date_key)
-        elif count > 0:
-            completed.add(date_key)
+        if not isinstance(row, dict) or count <= 0:
+            continue
+        status = str(row.get("status") or "")
+        if status in {"completed_target_reached", "completed_results_exhausted"}:
+            completed.add(str(date_key))
+        elif status == "completed":
+            # Legacy generic completion is trusted only with a supporting
+            # date-status record and durable rows for that date.
+            completed.add(str(date_key))
+        elif status == "skipped_resume":
+            underlying = str(row.get("underlying_status") or "")
+            if underlying in {"completed", "completed_target_reached", "completed_results_exhausted"}:
+                completed.add(str(date_key))
     return completed
 
 
@@ -2514,11 +2514,16 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
                         options=options,
                     )
                     output_files["partial_excel"] = None
-                    checkpoint = update_checkpoint_date(
-                        checkpoint,
-                        stay_date=stay_date,
-                        checkout_date=checkout_date,
-                        status=(
+                    completion_status = str(options.stats.get("completion_status") or "")
+                    if is_booking_source(config.source):
+                        if completion_status == "completed_target_reached":
+                            date_status = "completed_target_reached"
+                        elif completion_status == "completed_results_exhausted":
+                            date_status = "completed_results_exhausted"
+                        else:
+                            date_status = "incomplete_network_batches"
+                    else:
+                        date_status = (
                             "completed_target_reached"
                             if options.stats.get("final_stop_reason") == "completed_max_hotels_reached"
                             else "completed_resource_safe_limit"
@@ -2530,7 +2535,12 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
                             else "completed"
                             if date_results
                             else "completed_partial"
-                        ),
+                        )
+                    checkpoint = update_checkpoint_date(
+                        checkpoint,
+                        stay_date=stay_date,
+                        checkout_date=checkout_date,
+                        status=date_status,
                         attempts=attempt,
                         records_collected=len(date_results),
                         output_files=output_files,
@@ -2538,9 +2548,19 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
                     )
                     save_checkpoint(checkpoint)
                     push_date_rows(checkpoint)
-                    completed_dates.add(date_key)
-                    date_completed = True
-                    log(f"Date completed: {date_key}; records collected: {len(date_results)}")
+                    date_completed = date_status in {
+                        "completed",
+                        "completed_target_reached",
+                        "completed_results_exhausted",
+                    }
+                    if date_completed:
+                        completed_dates.add(date_key)
+                        log(f"Date completed: {date_key}; records collected: {len(date_results)}")
+                    else:
+                        log(
+                            f"Date remains resumable: {date_key}; status={date_status}; "
+                            f"records collected: {len(date_results)}"
+                        )
                     memory = guard.check(force=True)
                     log(
                         "Memory telemetry: "

@@ -27,12 +27,22 @@ DATE_TERMINAL_STATUSES = {
 
 COMPLETED_DATE_STATUSES = {
     "completed",
-    "completed_partial",
     "completed_target_reached",
     "completed_results_exhausted",
+    "skipped_resume",
+}
+
+RESUMABLE_DATE_STATUSES = {
+    "completed_partial",
     "completed_resource_safe_limit",
     "completed_hard_safety_limit",
-    "skipped_resume",
+    "stopped_resource_limit",
+    "incomplete_resource_soft_limit",
+    "incomplete_resource_hard_limit",
+    "incomplete_network_batches",
+    "incomplete_repeated_network_batch",
+    "incomplete_temporary_network_failure",
+    "incomplete_network_request_unavailable",
 }
 
 
@@ -177,6 +187,7 @@ def update_checkpoint_date(
     date_key = stay_date.isoformat()
     now = now_text()
     row = checkpoint.setdefault("date_statuses", {}).setdefault(date_key, {})
+    previous_status = row.get("status")
     started_at = row.get("started_at") or now
     row.update(
         {
@@ -196,6 +207,8 @@ def update_checkpoint_date(
             "exported_to_excel": bool((output_files or {}).get("partial_excel")),
         }
     )
+    if status == "skipped_resume" and previous_status:
+        row["underlying_status"] = previous_status
     checkpoint.setdefault("dates", {})[date_key] = {
         "status": status,
         "records_saved": records_collected,
@@ -209,6 +222,13 @@ def update_checkpoint_date(
     if status in COMPLETED_DATE_STATUSES - {"skipped_resume"}:
         _append_unique(checkpoint.setdefault("completed_dates", []), date_key)
         checkpoint["last_successful_date"] = date_key
+    elif status == "skipped_resume":
+        _append_unique(checkpoint.setdefault("completed_dates", []), date_key)
+    elif status in RESUMABLE_DATE_STATUSES:
+        checkpoint["completed_dates"] = [
+            value for value in checkpoint.setdefault("completed_dates", [])
+            if str(value) != date_key
+        ]
     elif status == "failed_after_retries":
         _append_unique(checkpoint.setdefault("failed_dates", []), date_key)
     elif status == "blocked_or_access_restricted":
