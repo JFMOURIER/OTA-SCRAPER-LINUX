@@ -8,7 +8,7 @@ import traceback
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 from playwright.sync_api import Error as PlaywrightError
@@ -20,6 +20,8 @@ from services.date_utils import calculate_checkout_date, format_timestamp_for_fi
 from services.booking_network_batches import (
     BookingNetworkBatch,
     batch_is_repeated,
+    booking_batch_fingerprint,
+    booking_response_fingerprint,
     is_booking_full_search_request,
     load_continuation,
     pagination_from_request_payload,
@@ -305,9 +307,6 @@ class BookingPlaywrightCollector(BaseCollector):
         debug_dir = options.debug_dir or Path("data/debug")
         screenshot_dir.mkdir(parents=True, exist_ok=True)
         debug_dir.mkdir(parents=True, exist_ok=True)
-        browser_mode_label = "Headless experimental mode" if options.headless else "Visible production mode"
-        self.log(log_callback, f"Browser mode selected: {browser_mode_label}")
-        self.log(log_callback, f"Launching Chromium with headless={options.headless}")
         results: list[dict] = []
         # This buffer is strictly date-scoped because a fresh collector is
         # created for every date and retry.  It contains only normalized card
@@ -447,6 +446,95 @@ class BookingPlaywrightCollector(BaseCollector):
             }
         )
 
+        if not collect_all_available_hotels:
+            partial_results = PaginationResults(
+                self._load_resumable_partial(checkin_date, options, log_callback)
+            )
+            maximum = max(1, int(max_hotels))
+            if partial_results.successful_count() >= maximum:
+                continuation = (
+                    load_continuation(options.partial_dir, checkin_date)
+                    if options.partial_dir
+                    else None
+                )
+                results = self._limit_successful_results(
+                    partial_results.values(),
+                    maximum,
+                )
+                next_offset = (
+                    continuation.next_offset if continuation is not None else 0
+                )
+                rows_per_page = (
+                    continuation.rows_per_page
+                    if continuation is not None
+                    else NORMAL_PAGE_SIZE
+                )
+                options.stats.update(
+                    {
+                        "network_batch_mode": True,
+                        "network_batch_offsets": [],
+                        "network_batches_collected": 0,
+                        "network_batch_resumed_unique_records": len(partial_results),
+                        "network_batch_resume_offset": next_offset,
+                        "unique_hotels_collected": len(results),
+                        "hotel_records_extracted": len(results),
+                        "hotels_extracted": len(results),
+                        "final_extracted_hotel_count": len(results),
+                        "hotels_kept_after_filters": len(results),
+                        "completion_status": "completed_target_reached",
+                        "network_batch_stop_reason": "target_reached_from_partial",
+                        "final_stop_reason": "completed_target_reached",
+                        "browser_launch_skipped_for_partial_target": True,
+                    }
+                )
+                metadata = {
+                    "network_batch_offset": None,
+                    "network_batch_next_offset": next_offset,
+                    "network_batch_rows_per_page": rows_per_page,
+                    "network_batches_collected": 0,
+                    "unique_hotels_collected": len(results),
+                    "new_hotels_added_last_batch": 0,
+                    "completion_status": "completed_target_reached",
+                }
+                if options.partial_results_callback:
+                    options.partial_results_callback(
+                        checkin_date,
+                        results,
+                        metadata,
+                    )
+                if options.partial_dir:
+                    state_path = save_continuation(
+                        Path(options.partial_dir),
+                        checkin_date,
+                        next_offset=next_offset,
+                        rows_per_page=rows_per_page,
+                        response_hashes=(
+                            continuation.response_hashes
+                            if continuation is not None
+                            else ()
+                        ),
+                        unique_records=len(results),
+                        completion_status="completed_target_reached",
+                    )
+                    options.stats["network_batch_state_path"] = str(
+                        state_path.resolve()
+                    )
+                self.log(
+                    log_callback,
+                    f"Partial target already satisfied with {len(results)} unique "
+                    "Booking records; Chromium launch skipped.",
+                )
+                step(
+                    1.0,
+                    "Booking.com partial records finalized without reopening browser",
+                    hotels_collected_current_date=len(results),
+                    **metadata,
+                )
+                return results
+
+        browser_mode_label = "Headless experimental mode" if options.headless else "Visible production mode"
+        self.log(log_callback, f"Browser mode selected: {browser_mode_label}")
+        self.log(log_callback, f"Launching Chromium with headless={options.headless}")
         self.log(log_callback, "Browser launched: starting Booking.com Chromium session.")
         step(0.03, "browser launched")
 
@@ -737,7 +825,15 @@ class BookingPlaywrightCollector(BaseCollector):
         }
         payload.update({key: value for key, value in updates.items() if value is not None})
         if options.status_callback:
-            options.status_callback(payload)
+            try:
+                options.status_callback(payload)
+            except ResourceLimitExceeded:
+                raise
+            except Exception as exc:
+                options.stats["status_callback_failure_count"] = int(
+                    options.stats.get("status_callback_failure_count", 0)
+                ) + 1
+                options.stats["last_status_callback_error"] = str(exc)
 
     def _write_json_safely(self, path: Path, payload: dict, log_callback: LogCallback | None = None) -> None:
         try:
@@ -1585,7 +1681,7 @@ class BookingPlaywrightCollector(BaseCollector):
             if options.resume_partial_results
             else None
         )
-        response_hashes = set(
+        response_fingerprints = set(
             continuation.response_hashes if continuation is not None else ()
         )
         options.stats.update(
@@ -1595,6 +1691,10 @@ class BookingPlaywrightCollector(BaseCollector):
                 "network_batch_unique_additions": [],
                 "network_batch_response_sizes": [],
                 "network_batch_response_hashes": [],
+                "network_batch_response_fingerprints": [],
+                "network_batch_duplicate_fingerprints_ignored": 0,
+                "network_batch_no_growth_count": 0,
+                "network_batch_repeated_offsets": [],
                 "network_batch_first_hotel_urls": [],
                 "network_batches_collected": 0,
                 "network_batch_retries": 0,
@@ -1650,7 +1750,7 @@ class BookingPlaywrightCollector(BaseCollector):
                     checkin_date,
                     next_offset=next_offset,
                     rows_per_page=rows_per_page,
-                    response_hashes=response_hashes,
+                    response_hashes=response_fingerprints,
                     unique_records=retained.successful_count(),
                     completion_status=status,
                 )
@@ -1689,10 +1789,78 @@ class BookingPlaywrightCollector(BaseCollector):
                 snapshot=snapshot,
             )
 
-        if retained.successful_count() >= maximum:
-            options.stats["completion_status"] = "completed_target_reached"
-            options.stats["network_batch_stop_reason"] = "target_reached_from_partial"
+        def complete_available_results(
+            *,
+            status: str,
+            next_offset: int,
+            rows_per_page: int,
+            reason: str,
+        ) -> list[dict]:
+            if retained.successful_count() <= 0:
+                raise PaginationUnsupportedError(
+                    f"Booking pagination stopped without usable hotel records: {reason}"
+                )
+            options.stats["completion_status"] = status
+            options.stats["network_batch_stop_reason"] = reason
+            options.stats["results_exhausted"] = (
+                status == "completed_results_exhausted"
+            )
+            options.stats["final_stop_reason"] = status
+            options.stats["actual_parse_failures"] = parse_failures
+            persist(
+                next_offset=next_offset,
+                rows_per_page=rows_per_page,
+                batch_offset=None,
+                added=0,
+                status=status,
+            )
             return self._limit_successful_results(retained.values(), maximum)
+
+        def bounded_dom_fallback(
+            *,
+            next_offset: int,
+            rows_per_page: int,
+            reason: str,
+        ) -> list[dict]:
+            status = self._bounded_dom_pagination_fallback(
+                page=page,
+                selector=selector,
+                base_url=base_url,
+                city_or_region=city_or_region,
+                checkin_date=checkin_date,
+                checkout_date=checkout_date,
+                number_of_nights=number_of_nights,
+                adults=adults,
+                currency=currency,
+                maximum=maximum,
+                retained=retained,
+                options=options,
+                filter_rows=filtered,
+                log_callback=log_callback,
+                screenshot_path=screenshot_path,
+                reason=reason,
+            )
+            return complete_available_results(
+                status=status,
+                next_offset=next_offset,
+                rows_per_page=rows_per_page,
+                reason=str(
+                    options.stats.get("network_batch_stop_reason")
+                    or reason
+                ),
+            )
+
+        if retained.successful_count() >= maximum:
+            return complete_available_results(
+                status="completed_target_reached",
+                next_offset=continuation.next_offset if continuation is not None else 0,
+                rows_per_page=(
+                    continuation.rows_per_page
+                    if continuation is not None
+                    else NORMAL_PAGE_SIZE
+                ),
+                reason="target_reached_from_partial",
+            )
 
         # Scrolling to the genuine button may make Booking lazily render its cached
         # first 75 cards. Extract this one bounded bootstrap before clicking; all
@@ -1786,50 +1954,71 @@ class BookingPlaywrightCollector(BaseCollector):
                 added=0,
                 status="incomplete_network_request_unavailable",
             )
-            raise PaginationUnsupportedError(
-                "Booking Load more was unavailable and true result exhaustion "
-                "could not be proven."
+            return bounded_dom_fallback(
+                next_offset=bootstrap_count,
+                rows_per_page=NORMAL_PAGE_SIZE,
+                reason="load_more_not_available_after_bootstrap",
             )
 
-        captured_batch, request_url, request_template, response_size = (
-            self._capture_booking_network_batch(
-                page,
-                found,
-                options=options,
-                log_callback=log_callback,
+        try:
+            captured_batch, request_url, request_template, response_size = (
+                self._capture_booking_network_batch(
+                    page,
+                    found,
+                    options=options,
+                    log_callback=log_callback,
+                )
             )
-        )
+        except PaginationUnsupportedError:
+            if retained.successful_count() <= 0:
+                raise
+            return bounded_dom_fallback(
+                next_offset=bootstrap_count,
+                rows_per_page=NORMAL_PAGE_SIZE,
+                reason="network_capture_unavailable_with_retained_results",
+            )
         template_offset, rows_per_page = pagination_from_request_payload(
             request_template
         )
         if captured_batch.offset != template_offset:
-            raise PaginationUnsupportedError(
-                "Booking FullSearch response offset did not match its request."
+            options.stats["network_batch_offset_mismatches"] = [
+                {
+                    "requested_offset": template_offset,
+                    "response_offset": captured_batch.offset,
+                }
+            ]
+            self.log(
+                log_callback,
+                "Booking FullSearch response offset did not match its request; "
+                "hotel identities will determine whether the response adds data.",
             )
 
-        def consume(batch: BookingNetworkBatch, size: int) -> int:
+        def consume(
+            batch: BookingNetworkBatch,
+            size: int,
+            *,
+            fingerprint: str,
+            response_fingerprint: str,
+        ) -> tuple[int, str | None]:
             nonlocal parse_failures
-            if batch_is_repeated(
-                batch,
-                previous_hashes=response_hashes,
-                existing_rows=retained.values(),
+            if (
+                fingerprint in response_fingerprints
+                or response_fingerprint in response_fingerprints
             ):
-                options.stats["completion_status"] = (
-                    "incomplete_repeated_network_batch"
+                options.stats["network_batch_duplicate_fingerprints_ignored"] = int(
+                    options.stats.get(
+                        "network_batch_duplicate_fingerprints_ignored", 0
+                    )
+                ) + 1
+                options.stats["network_batch_repeated_offsets"].append(batch.offset)
+                self.log(
+                    log_callback,
+                    f"Ignored already processed Booking network fingerprint "
+                    f"at offset={batch.offset}.",
                 )
-                options.stats["network_batch_stop_reason"] = "repeated_batch"
-                persist(
-                    next_offset=batch.offset,
-                    rows_per_page=batch.rows_per_page,
-                    batch_offset=batch.offset,
-                    added=0,
-                    status="incomplete_repeated_network_batch",
-                )
-                raise PaginationUnsupportedError(
-                    f"Booking repeated the network batch at offset {batch.offset}; "
-                    "the date remains resumable."
-                )
-            response_hashes.add(batch.response_hash)
+                return 0, "duplicate_fingerprint"
+            response_fingerprints.add(fingerprint)
+            response_fingerprints.add(response_fingerprint)
             rows = self._booking_network_rows(
                 batch,
                 city_or_region=city_or_region,
@@ -1855,6 +2044,9 @@ class BookingPlaywrightCollector(BaseCollector):
             options.stats["network_batch_response_sizes"].append(size)
             options.stats["network_batch_response_hashes"].append(
                 batch.response_hash
+            )
+            options.stats["network_batch_response_fingerprints"].append(
+                fingerprint
             )
             options.stats["network_batch_first_hotel_urls"].append(
                 batch.properties[0].get("hotel_url")
@@ -1885,13 +2077,19 @@ class BookingPlaywrightCollector(BaseCollector):
                 f"Booking network batch {batch.offset}: "
                 f"{retained.successful_count()} unique hotels saved",
             )
-            return added
+            if added == 0:
+                options.stats["network_batch_no_growth_count"] = int(
+                    options.stats.get("network_batch_no_growth_count", 0)
+                ) + 1
+                options.stats["network_batch_repeated_offsets"].append(batch.offset)
+                return 0, "no_new_unique_hotels"
+            return added, None
 
         captured_already_saved = bool(
             continuation is not None
             and captured_batch.next_offset <= continuation.next_offset
             and (
-                captured_batch.response_hash in response_hashes
+                captured_batch.response_hash in response_fingerprints
                 or batch_is_repeated(
                     captured_batch,
                     previous_hashes=set(),
@@ -1907,7 +2105,33 @@ class BookingPlaywrightCollector(BaseCollector):
                 f"{continuation.next_offset}.",
             )
         else:
-            consume(captured_batch, response_size)
+            captured_fingerprint = booking_batch_fingerprint(
+                captured_batch,
+                request_url=request_url,
+                request_payload=request_template,
+            )
+            captured_response_fingerprint = booking_response_fingerprint(
+                captured_batch
+            )
+            _captured_added, captured_no_growth = consume(
+                captured_batch,
+                response_size,
+                fingerprint=captured_fingerprint,
+                response_fingerprint=captured_response_fingerprint,
+            )
+            if captured_no_growth:
+                options.stats["network_batch_repeat_diagnostic"] = {
+                    "kind": captured_no_growth,
+                    "offset": captured_batch.offset,
+                    "rows_per_page": captured_batch.rows_per_page,
+                    "fingerprint": captured_fingerprint,
+                    "retained_unique_records": retained.successful_count(),
+                }
+                return bounded_dom_fallback(
+                    next_offset=captured_batch.next_offset,
+                    rows_per_page=captured_batch.rows_per_page,
+                    reason=f"captured_batch_{captured_no_growth}",
+                )
 
         # Replace the one-time bootstrap DOM immediately. Replayed batches use the
         # BrowserContext request API and therefore never add cards to the page.
@@ -1958,30 +2182,73 @@ class BookingPlaywrightCollector(BaseCollector):
                     "stopped_by_user: cancelled during Booking network batches"
                 )
             if next_offset > maximum_offset:
-                options.stats["completion_status"] = (
-                    "incomplete_network_pagination_guard"
-                )
-                options.stats["network_batch_stop_reason"] = "maximum_offset_guard"
-                persist(
+                return bounded_dom_fallback(
                     next_offset=next_offset,
                     rows_per_page=rows_per_page,
-                    batch_offset=None,
-                    added=0,
-                    status="incomplete_network_pagination_guard",
+                    reason=f"maximum_offset_guard_{maximum_offset}",
                 )
-                raise PaginationUnsupportedError(
-                    f"Booking network offset exceeded guard {maximum_offset}."
+            try:
+                batch, response_size = self._replay_booking_network_batch(
+                    page,
+                    request_url=request_url,
+                    request_template=request_template,
+                    offset=next_offset,
+                    options=options,
+                    log_callback=log_callback,
                 )
-            batch, response_size = self._replay_booking_network_batch(
-                page,
-                request_url=request_url,
-                request_template=request_template,
-                offset=next_offset,
-                options=options,
-                log_callback=log_callback,
+            except PaginationUnsupportedError:
+                if retained.successful_count() <= 0:
+                    raise
+                return bounded_dom_fallback(
+                    next_offset=next_offset,
+                    rows_per_page=rows_per_page,
+                    reason="network_replay_unavailable_with_retained_results",
+                )
+            replay_payload = request_payload_for_offset(
+                request_template,
+                next_offset,
             )
-            consume(batch, response_size)
-            next_offset = batch.next_offset
+            fingerprint = booking_batch_fingerprint(
+                batch,
+                request_url=request_url,
+                request_payload=replay_payload,
+            )
+            response_fingerprint = booking_response_fingerprint(batch)
+            if batch.offset != next_offset:
+                mismatches = options.stats.setdefault(
+                    "network_batch_offset_mismatches", []
+                )
+                if isinstance(mismatches, list):
+                    mismatches.append(
+                        {
+                            "requested_offset": next_offset,
+                            "response_offset": batch.offset,
+                        }
+                    )
+            _added, no_growth = consume(
+                batch,
+                response_size,
+                fingerprint=fingerprint,
+                response_fingerprint=response_fingerprint,
+            )
+            if no_growth:
+                options.stats["network_batch_repeat_diagnostic"] = {
+                    "kind": no_growth,
+                    "requested_offset": next_offset,
+                    "response_offset": batch.offset,
+                    "rows_per_page": batch.rows_per_page,
+                    "fingerprint": fingerprint,
+                    "retained_unique_records": retained.successful_count(),
+                }
+                return bounded_dom_fallback(
+                    next_offset=max(next_offset, batch.next_offset),
+                    rows_per_page=batch.rows_per_page,
+                    reason=f"replayed_batch_{no_growth}",
+                )
+            next_offset = max(
+                next_offset + max(1, batch.rows_per_page),
+                batch.next_offset,
+            )
             record_resource_level(next_offset)
             if retained.successful_count() >= maximum:
                 completion = "completed_target_reached"
@@ -2007,6 +2274,205 @@ class BookingPlaywrightCollector(BaseCollector):
             status=completion,
         )
         return self._limit_successful_results(retained.values(), maximum)
+
+    def _bounded_dom_pagination_fallback(
+        self,
+        *,
+        page,
+        selector: str,
+        base_url: str,
+        city_or_region: str,
+        checkin_date: date,
+        checkout_date: date,
+        number_of_nights: int,
+        adults: int,
+        currency: str,
+        maximum: int,
+        retained: PaginationResults,
+        options: CollectorOptions,
+        filter_rows: Callable[[list[dict]], list[dict]],
+        log_callback: LogCallback | None,
+        screenshot_path: Path | None,
+        reason: str,
+    ) -> str:
+        """Try at most two visible-DOM cycles, then accept a usable plateau."""
+
+        max_attempts = 2
+        screenshot_paths: list[Path] = []
+        attempt_rows: list[dict[str, Any]] = []
+        options.stats["network_dom_fallback_trigger"] = reason
+        options.stats["network_dom_fallback_max_attempts"] = max_attempts
+        self.log(
+            log_callback,
+            "Booking network pagination made no unique progress; attempting "
+            f"up to {max_attempts} bounded visible-DOM fallback cycles.",
+        )
+
+        for attempt in range(1, max_attempts + 1):
+            before = retained.successful_count()
+            if before >= maximum:
+                options.stats["network_batch_stop_reason"] = (
+                    "target_reached_before_dom_fallback"
+                )
+                options.stats["network_dom_fallback_attempts"] = attempt - 1
+                options.stats["network_dom_fallback_cycles"] = attempt_rows
+                return "completed_target_reached"
+
+            current_count = self._valid_card_count(page, selector)
+            options.stats["maximum_live_dom_cards"] = max(
+                int(options.stats.get("maximum_live_dom_cards") or 0),
+                current_count,
+            )
+            visible_rows = self._bulk_extract_cards(
+                page,
+                selector,
+                current_count,
+                city_or_region,
+                base_url,
+                checkin_date,
+                checkout_date,
+                number_of_nights,
+                adults,
+                currency,
+                screenshot_path,
+                log_callback,
+                options,
+                ranking_offset=0,
+            )
+            visible_rows = filter_rows(visible_rows)
+            visible_rows = self._limit_successful_results(
+                visible_rows,
+                max(0, maximum - retained.successful_count()),
+            )
+            retained.add(visible_rows)
+            after_extract = retained.successful_count()
+            if after_extract >= maximum:
+                attempt_rows.append(
+                    {
+                        "attempt": attempt,
+                        "cards_before_click": current_count,
+                        "load_more_succeeded": False,
+                        "unique_before": before,
+                        "unique_after": after_extract,
+                        "new_unique": after_extract - before,
+                    }
+                )
+                options.stats["network_dom_fallback_attempts"] = attempt
+                options.stats["network_dom_fallback_cycles"] = attempt_rows
+                options.stats["unique_hotels_collected"] = after_extract
+                options.stats["network_batch_stop_reason"] = (
+                    "target_reached_during_dom_fallback"
+                )
+                return "completed_target_reached"
+
+            explicit_end = self._detect_end_of_results_text(
+                self._bottom_visible_text(page)
+            )
+            if explicit_end:
+                attempt_rows.append(
+                    {
+                        "attempt": attempt,
+                        "cards_before_click": current_count,
+                        "load_more_succeeded": False,
+                        "unique_before": before,
+                        "unique_after": after_extract,
+                        "new_unique": after_extract - before,
+                        "end_of_results": explicit_end,
+                    }
+                )
+                options.stats["network_dom_fallback_attempts"] = attempt
+                options.stats["network_dom_fallback_cycles"] = attempt_rows
+                options.stats["unique_hotels_collected"] = after_extract
+                options.stats["network_batch_stop_reason"] = (
+                    "end_of_results_during_dom_fallback"
+                )
+                return "completed_results_exhausted"
+
+            loaded = self.click_load_more_results(
+                page,
+                current_count,
+                log_callback,
+                selector=selector,
+                options=options,
+                screenshot_dir=options.screenshot_dir,
+                screenshot_paths=screenshot_paths,
+                results_url=base_url,
+            )
+            next_count = self._valid_card_count(page, selector)
+            options.stats["maximum_live_dom_cards"] = max(
+                int(options.stats.get("maximum_live_dom_cards") or 0),
+                next_count,
+            )
+            next_rows = self._bulk_extract_cards(
+                page,
+                selector,
+                next_count,
+                city_or_region,
+                base_url,
+                checkin_date,
+                checkout_date,
+                number_of_nights,
+                adults,
+                currency,
+                screenshot_path,
+                log_callback,
+                options,
+                ranking_offset=0,
+            )
+            next_rows = filter_rows(next_rows)
+            next_rows = self._limit_successful_results(
+                next_rows,
+                max(0, maximum - retained.successful_count()),
+            )
+            retained.add(next_rows)
+            after = retained.successful_count()
+            attempt_rows.append(
+                {
+                    "attempt": attempt,
+                    "cards_before_click": current_count,
+                    "cards_after_click": next_count,
+                    "load_more_succeeded": bool(loaded),
+                    "unique_before": before,
+                    "unique_after": after,
+                    "new_unique": after - before,
+                }
+            )
+            options.stats["network_dom_fallback_attempts"] = attempt
+            options.stats["network_dom_fallback_cycles"] = attempt_rows
+            options.stats["unique_hotels_collected"] = after
+            self.log(
+                log_callback,
+                f"Booking DOM fallback {attempt}/{max_attempts}: "
+                f"cards={current_count}->{next_count}, unique={before}->{after}.",
+            )
+            if after >= maximum:
+                options.stats["network_batch_stop_reason"] = (
+                    "target_reached_during_dom_fallback"
+                )
+                return "completed_target_reached"
+
+            explicit_end = self._detect_end_of_results_text(
+                self._bottom_visible_text(page)
+            )
+            if explicit_end:
+                options.stats["network_dom_fallback_end_condition"] = explicit_end
+                options.stats["network_batch_stop_reason"] = (
+                    "end_of_results_during_dom_fallback"
+                )
+                return "completed_results_exhausted"
+
+        if retained.successful_count() <= 0:
+            raise PaginationUnsupportedError(
+                "Booking pagination plateau produced zero usable hotel records."
+            )
+        options.stats["network_batch_stop_reason"] = (
+            "pagination_plateau_after_bounded_dom_fallback"
+        )
+        options.stats["collection_completeness_warning"] = (
+            "Booking pagination plateaued after two bounded DOM fallback cycles; "
+            "all usable unique results were retained."
+        )
+        return "completed_pagination_plateau"
 
     def _capture_booking_network_batch(
         self,

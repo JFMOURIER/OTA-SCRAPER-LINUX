@@ -263,6 +263,7 @@ class BookingNetworkBatch:
     properties: tuple[dict[str, Any], ...]
     parse_failures: int
     response_hash: str
+    payload_hash: str
 
     @property
     def result_count(self) -> int:
@@ -325,6 +326,15 @@ def parse_booking_network_batch(
     response_hash = hashlib.sha256(
         "\n".join(identities).encode("utf-8")
     ).hexdigest()
+    payload_hash = hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
     return BookingNetworkBatch(
         offset=max(0, int(offset)),
         rows_per_page=max(1, int(rows_per_page)),
@@ -332,7 +342,71 @@ def parse_booking_network_batch(
         properties=tuple(properties),
         parse_failures=parse_failures,
         response_hash=response_hash,
+        payload_hash=payload_hash,
     )
+
+
+def booking_batch_fingerprint(
+    batch: BookingNetworkBatch,
+    *,
+    request_url: str,
+    request_payload: dict[str, Any],
+) -> str:
+    """Fingerprint one requested response without making offset authoritative."""
+
+    requested_offset, requested_rows = pagination_from_request_payload(request_payload)
+    parsed_url = urlparse(str(request_url))
+    stable_url = f"{parsed_url.scheme.lower()}://{parsed_url.netloc.lower()}{parsed_url.path}"
+    fingerprint = {
+        "request_url": stable_url,
+        "requested_offset": requested_offset,
+        "requested_rows_per_page": requested_rows,
+        "response_offset": batch.offset,
+        "response_rows_per_page": batch.rows_per_page,
+        "payload_hash": batch.payload_hash,
+        "result_identity_hash": batch.response_hash,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            fingerprint,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def booking_response_fingerprint(batch: BookingNetworkBatch) -> str:
+    """Identify a response independently of the request that surfaced it."""
+
+    response = {
+        "response_offset": batch.offset,
+        "response_rows_per_page": batch.rows_per_page,
+        "result_count": batch.result_count,
+        "result_identity_hash": batch.response_hash,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            response,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def batch_identity_set(batch: BookingNetworkBatch) -> set[str]:
+    identities = {
+        hotel_identity(
+            {
+                "hotel_name": row.get("hotel_name"),
+                "hotel_url": row.get("hotel_url"),
+            }
+        )
+        for row in batch.properties
+    }
+    identities.discard("")
+    return identities
 
 
 def batch_is_repeated(
@@ -344,16 +418,7 @@ def batch_is_repeated(
     if batch.response_hash in previous_hashes:
         return True
     existing = {hotel_identity(row) for row in existing_rows}
-    keys = {
-        hotel_identity(
-            {
-                "hotel_name": row.get("hotel_name"),
-                "hotel_url": row.get("hotel_url"),
-            }
-        )
-        for row in batch.properties
-    }
-    keys.discard("")
+    keys = batch_identity_set(batch)
     return bool(keys) and keys <= existing
 
 

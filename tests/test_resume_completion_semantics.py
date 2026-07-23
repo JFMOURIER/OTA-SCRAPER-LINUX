@@ -4,7 +4,7 @@ import unittest
 from datetime import date
 
 from app import completed_dates_from_checkpoint_and_db
-from services.job_runner import build_checkpoint, update_checkpoint_date
+from services.job_runner import final_run_status, update_checkpoint_date
 
 
 class ResumeCompletionSemanticsTests(unittest.TestCase):
@@ -44,6 +44,29 @@ class ResumeCompletionSemanticsTests(unittest.TestCase):
         self.assertEqual(
             completed_dates_from_checkpoint_and_db(checkpoint, {"2026-09-10": 25}),
             {"2026-09-10"},
+        )
+
+    def test_pagination_plateau_with_rows_is_skipped_and_run_completes(self):
+        checkpoint = self._checkpoint("completed_pagination_plateau")
+        self.assertEqual(
+            completed_dates_from_checkpoint_and_db(checkpoint, {"2026-09-10": 125}),
+            {"2026-09-10"},
+        )
+        self.assertEqual(
+            final_run_status(
+                [
+                    {
+                        "checkin_date": "2026-09-10",
+                        "status": "completed_pagination_plateau",
+                    },
+                    {
+                        "checkin_date": "2026-09-11",
+                        "status": "completed_target_reached",
+                    },
+                ],
+                stopped=False,
+            ),
+            "completed_all_dates",
         )
 
     def test_bare_completed_date_is_not_trusted(self):

@@ -117,6 +117,11 @@ SCRAPER_LOCK_FILE = INSTANCE_CONFIG.data_dir / "status" / "active_scraper.lock"
 CANCEL_FILE = STATUS_DIR / "cancel_request.json"
 WORKER_STOP_GRACE_SECONDS = 8.0
 MAX_UI_RESULTS = 500
+BOOKING_COMPLETED_DATE_STATUSES = {
+    "completed_target_reached",
+    "completed_results_exhausted",
+    "completed_pagination_plateau",
+}
 
 
 st.set_page_config(page_title="Hotel Price Collector", page_icon=":hotel:", layout="wide")
@@ -1607,7 +1612,7 @@ def completed_dates_from_checkpoint_and_db(checkpoint: dict[str, Any], counts: d
         if not isinstance(row, dict) or count <= 0:
             continue
         status = str(row.get("status") or "")
-        if status in {"completed_target_reached", "completed_results_exhausted"}:
+        if status in BOOKING_COMPLETED_DATE_STATUSES:
             completed.add(str(date_key))
         elif status == "completed":
             # Legacy generic completion is trusted only with a supporting
@@ -1615,7 +1620,7 @@ def completed_dates_from_checkpoint_and_db(checkpoint: dict[str, Any], counts: d
             completed.add(str(date_key))
         elif status == "skipped_resume":
             underlying = str(row.get("underlying_status") or "")
-            if underlying in {"completed", "completed_target_reached", "completed_results_exhausted"}:
+            if underlying in {"completed", *BOOKING_COMPLETED_DATE_STATUSES}:
                 completed.add(str(date_key))
     return completed
 
@@ -2566,10 +2571,8 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
                     output_files["partial_excel"] = None
                     completion_status = str(options.stats.get("completion_status") or "")
                     if is_booking_source(config.source):
-                        if completion_status == "completed_target_reached":
-                            date_status = "completed_target_reached"
-                        elif completion_status == "completed_results_exhausted":
-                            date_status = "completed_results_exhausted"
+                        if completion_status in BOOKING_COMPLETED_DATE_STATUSES:
+                            date_status = completion_status
                         else:
                             date_status = "incomplete_network_batches"
                     else:
@@ -2602,6 +2605,7 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
                         "completed",
                         "completed_target_reached",
                         "completed_results_exhausted",
+                        "completed_pagination_plateau",
                     }
                     if date_completed:
                         completed_dates.add(date_key)
@@ -2641,6 +2645,7 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
                                 "completed_partial",
                                 "completed_target_reached",
                                 "completed_results_exhausted",
+                                "completed_pagination_plateau",
                                 "completed_resource_safe_limit",
                                 "completed_hard_safety_limit",
                                 "skipped_resume",

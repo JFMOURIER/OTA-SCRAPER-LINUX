@@ -21,6 +21,7 @@ DATE_TERMINAL_STATUSES = {
     "stopped_resource_limit",
     "completed_target_reached",
     "completed_results_exhausted",
+    "completed_pagination_plateau",
     "completed_resource_safe_limit",
     "completed_hard_safety_limit",
 }
@@ -29,6 +30,7 @@ COMPLETED_DATE_STATUSES = {
     "completed",
     "completed_target_reached",
     "completed_results_exhausted",
+    "completed_pagination_plateau",
     "skipped_resume",
 }
 
