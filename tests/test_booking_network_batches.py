@@ -26,6 +26,11 @@ from services.booking_pagination import PaginationResults
 from services.scraper_errors import AccessRestrictionError, PaginationUnsupportedError
 from services.resource_guard import ResourceLimitExceeded
 from services.job_runner import save_partial_records
+from services.partial_policy import (
+    POLICY_EXPLICIT,
+    build_partial_metadata,
+    write_partial_metadata,
+)
 
 
 CHECKIN = date(2026, 9, 10)
@@ -36,6 +41,58 @@ BASE_URL = (
     "&group_adults=2&selected_currency=USD&order=price&nflt=ht_id%3D204"
 )
 REQUEST_URL = "https://www.booking.com/dml/graphql?lang=en-us"
+PARTIAL_FINGERPRINT = {
+    "instance_id": "test",
+    "source": "Booking.com",
+    "city_or_destination_id": "orlando",
+    "checkin": CHECKIN.isoformat(),
+    "checkout": CHECKOUT.isoformat(),
+    "stay_length": 1,
+    "adults": 2,
+    "rooms": 1,
+    "currency": "USD",
+    "selected_star_ratings": [1, 2, 3, 4, 5],
+    "include_unknown_star_rating": True,
+    "hotels_only": True,
+    "collect_all": False,
+    "maximum_hotels": 150,
+    "sort_order": "price",
+}
+
+
+def save_test_partial(
+    partial_dir: Path,
+    rows: list[dict],
+    *,
+    maximum: int,
+) -> None:
+    save_partial_records(partial_dir, CHECKIN, rows)
+    fingerprint = {**PARTIAL_FINGERPRINT, "maximum_hotels": maximum}
+    write_partial_metadata(
+        partial_dir,
+        CHECKIN,
+        build_partial_metadata(
+            fingerprint,
+            job_id="test-job",
+            run_id=42,
+        ),
+    )
+
+
+def enable_explicit_partial(
+    options: CollectorOptions,
+    *,
+    maximum: int,
+) -> CollectorOptions:
+    options.resume_partial_results = True
+    options.partial_resume_policy = POLICY_EXPLICIT
+    options.partial_fingerprint = {
+        **PARTIAL_FINGERPRINT,
+        "maximum_hotels": maximum,
+    }
+    options.partial_job_id = "test-job"
+    options.partial_run_id = 42
+    return options
 
 
 def request_payload(offset: int = 75, rows_per_page: int = 25) -> dict:
@@ -493,7 +550,7 @@ class BookingNetworkBatchTests(unittest.TestCase):
         self.assertEqual(len(rows), 125)
         self.assertEqual(
             options.stats["completion_status"],
-            "completed_results_exhausted",
+            "completed_verified_end_of_results",
         )
         self.assertTrue(options.stats["results_exhausted"])
 
@@ -507,12 +564,12 @@ class BookingNetworkBatchTests(unittest.TestCase):
         rows, options, partial_events, _page = self._run_collection(
             options=options,
             replay_batches={100: repeated, 125: repeated},
-            fallback_status="completed_pagination_plateau",
+            fallback_status="completed_verified_plateau",
         )
         self.assertEqual(len(rows), 125)
         self.assertEqual(
             options.stats["completion_status"],
-            "completed_pagination_plateau",
+            "completed_verified_plateau",
         )
         self.assertEqual(
             options.stats["network_batch_duplicate_fingerprints_ignored"],
@@ -523,27 +580,26 @@ class BookingNetworkBatchTests(unittest.TestCase):
     def test_repeated_offset_with_resumable_partial_records_does_not_fail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             partial_dir = Path(directory)
-            save_partial_records(
+            save_test_partial(
                 partial_dir,
-                CHECKIN,
                 [hotel(index) for index in range(226)],
+                maximum=250,
             )
-            options = CollectorOptions(
+            options = enable_explicit_partial(CollectorOptions(
                 screenshots_enabled=False,
                 disable_filters_during_complete_collection=True,
                 resource_check_callback=lambda: ("ok", {"reason": "test"}),
                 partial_dir=partial_dir,
-                resume_partial_results=True,
-            )
+            ), maximum=250)
             rows, options, partial_events, _page = self._run_collection(
                 maximum=250,
                 options=options,
-                fallback_status="completed_pagination_plateau",
+                fallback_status="completed_verified_plateau",
             )
         self.assertEqual(len(rows), 226)
         self.assertEqual(
             options.stats["completion_status"],
-            "completed_pagination_plateau",
+            "completed_verified_plateau",
         )
         self.assertEqual(
             options.stats["network_batch_repeat_diagnostic"]["offset"],
@@ -583,18 +639,17 @@ class BookingNetworkBatchTests(unittest.TestCase):
     def test_partial_unique_records_reach_max_without_network_request(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             partial_dir = Path(directory)
-            save_partial_records(
+            save_test_partial(
                 partial_dir,
-                CHECKIN,
                 [hotel(index) for index in range(100)],
+                maximum=100,
             )
-            options = CollectorOptions(
+            options = enable_explicit_partial(CollectorOptions(
                 screenshots_enabled=False,
                 disable_filters_during_complete_collection=True,
                 resource_check_callback=lambda: ("ok", {"reason": "test"}),
                 partial_dir=partial_dir,
-                resume_partial_results=True,
-            )
+            ), maximum=100)
             rows, options, partial_events, page = self._run_collection(
                 maximum=100,
                 options=options,
@@ -619,19 +674,18 @@ class BookingNetworkBatchTests(unittest.TestCase):
         collector = BookingPlaywrightCollector()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            save_partial_records(
+            save_test_partial(
                 root / "partial",
-                CHECKIN,
                 [hotel(index) for index in range(100)],
+                maximum=100,
             )
-            options = CollectorOptions(
+            options = enable_explicit_partial(CollectorOptions(
                 screenshots_enabled=False,
                 disable_filters_during_complete_collection=True,
                 partial_dir=root / "partial",
-                resume_partial_results=True,
                 screenshot_dir=root / "screenshots",
                 debug_dir=root / "debug",
-            )
+            ), maximum=100)
             with patch(
                 "collectors.booking_playwright.sync_playwright"
             ) as playwright:
@@ -655,7 +709,7 @@ class BookingNetworkBatchTests(unittest.TestCase):
             "completed_target_reached",
         )
 
-    def test_bounded_dom_fallback_plateaus_after_exactly_two_cycles(self) -> None:
+    def test_bounded_dom_fallback_requires_three_verified_no_growth_cycles(self) -> None:
         collector = BookingPlaywrightCollector()
         options = CollectorOptions(
             screenshots_enabled=False,
@@ -691,12 +745,12 @@ class BookingNetworkBatchTests(unittest.TestCase):
                 screenshot_path=None,
                 reason="duplicate_fingerprint",
             )
-        self.assertEqual(status, "completed_pagination_plateau")
-        self.assertEqual(click.call_count, 2)
-        self.assertEqual(options.stats["network_dom_fallback_attempts"], 2)
+        self.assertEqual(status, "completed_verified_plateau")
+        self.assertEqual(click.call_count, 3)
+        self.assertEqual(options.stats["network_dom_fallback_attempts"], 3)
         self.assertEqual(
             [row["new_unique"] for row in options.stats["network_dom_fallback_cycles"]],
-            [0, 0],
+            [0, 0, 0],
         )
 
     def test_zero_usable_records_with_pagination_plateau_still_fails(self) -> None:
@@ -786,7 +840,7 @@ class BookingNetworkBatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             partial_dir = Path(directory)
             initial = [hotel(index) for index in range(125)]
-            save_partial_records(partial_dir, CHECKIN, initial)
+            save_test_partial(partial_dir, initial, maximum=150)
             hash_75 = parsed_batch(75).response_hash
             hash_100 = parsed_batch(100).response_hash
             save_continuation(
@@ -798,13 +852,12 @@ class BookingNetworkBatchTests(unittest.TestCase):
                 unique_records=125,
                 completion_status="incomplete_network_batches",
             )
-            options = CollectorOptions(
+            options = enable_explicit_partial(CollectorOptions(
                 screenshots_enabled=False,
                 disable_filters_during_complete_collection=True,
                 resource_check_callback=lambda: ("ok", {"reason": "test"}),
                 partial_dir=partial_dir,
-                resume_partial_results=True,
-            )
+            ), maximum=150)
             rows, options, _partials, _page = self._run_collection(
                 options=options,
                 replay_batches={125: parsed_batch(125)},

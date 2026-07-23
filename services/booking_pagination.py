@@ -48,24 +48,65 @@ class PaginationResults:
         self.add(rows)
 
     def add(self, rows: Iterable[dict[str, Any]]) -> int:
+        return int(self.add_with_diagnostics(rows)["new_identities"])
+
+    def add_with_diagnostics(
+        self,
+        rows: Iterable[dict[str, Any]],
+    ) -> dict[str, int]:
         added = 0
+        parsed = 0
+        duplicates = 0
+        missing_identity = 0
+        identity_collisions = 0
         for source in rows:
+            parsed += 1
             row = dict(source)
             canonical_url = canonical_hotel_url(row.get("hotel_url"))
             if canonical_url:
                 row["hotel_url"] = canonical_url
             key = hotel_identity(row)
             if not key:
+                missing_identity += 1
                 continue
             if key in self._rows:
                 current = self._rows[key]
+                duplicates += 1
+                current_name = " ".join(
+                    str(current.get("hotel_name") or current.get("name") or "")
+                    .lower()
+                    .split()
+                )
+                next_name = " ".join(
+                    str(row.get("hotel_name") or row.get("name") or "")
+                    .lower()
+                    .split()
+                )
+                current_id = str(current.get("ota_hotel_id") or "").strip()
+                next_id = str(row.get("ota_hotel_id") or "").strip()
+                if (
+                    current_name
+                    and next_name
+                    and current_name != next_name
+                ) or (
+                    current_id
+                    and next_id
+                    and current_id != next_id
+                ):
+                    identity_collisions += 1
                 for field, value in row.items():
                     if value not in (None, "", [], {}):
                         current[field] = value
                 continue
             self._rows[key] = row
             added += 1
-        return added
+        return {
+            "raw_records_parsed": parsed,
+            "new_identities": added,
+            "duplicate_identities": duplicates,
+            "missing_identities": missing_identity,
+            "identity_collisions": identity_collisions,
+        }
 
     def values(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self._rows.values()]

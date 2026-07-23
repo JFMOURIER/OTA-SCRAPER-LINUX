@@ -162,6 +162,44 @@ def count_results_by_run_id(run_id: int, backend: str | None = None) -> int:
         return int(conn.execute("select count(*) from hotel_price_results where collection_run_id = ?", (run_id,)).fetchone()[0])
 
 
+def result_aggregates_by_run_id(
+    run_id: int,
+    backend: str | None = None,
+) -> dict[str, Any]:
+    """Return authoritative full-run metrics without loading the UI preview."""
+
+    identity_sql = (
+        "nullif(lower(coalesce(nullif(hotel_url, ''), "
+        "nullif(hotel_name, ''), '')), '')"
+    )
+    price_sql = "coalesce(parsed_price, cheapest_price_total)"
+    query = f"""
+        select
+            count(*) as total_observations,
+            count(distinct {identity_sql}) as unique_hotels,
+            count(distinct checkin_date) as completed_dates_with_rows,
+            sum(case when raw_price_text is not null and trim(raw_price_text) <> '' then 1 else 0 end) as rows_with_raw_price,
+            sum(case when {price_sql} is not null then 1 else 0 end) as rows_with_parsed_price,
+            sum(case when {price_sql} is null then 1 else 0 end) as rows_missing_price,
+            sum(case when collection_status = 'success' then 1 else 0 end) as successful_records,
+            sum(case when collection_status <> 'success' then 1 else 0 end) as failed_records,
+            min({price_sql}) as minimum_price,
+            max({price_sql}) as maximum_price
+        from hotel_price_results
+        where collection_run_id = {{placeholder}}
+    """
+    if normalize_backend(backend) == "postgres":
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query.format(placeholder="%s"), (run_id,))
+                row = cur.fetchone()
+                columns = [description.name for description in cur.description]
+                return dict(zip(columns, row))
+    with _sqlite_connection() as conn:
+        row = conn.execute(query.format(placeholder="?"), (run_id,)).fetchone()
+        return dict(row) if row is not None else {}
+
+
 def result_date_counts_by_run_id(run_id: int, backend: str | None = None) -> dict[str, int]:
     if normalize_backend(backend) == "postgres":
         with get_connection() as conn:
@@ -280,7 +318,9 @@ def _init_sqlite() -> None:
                 search_url text,
                 hotel_name text,
                 raw_hotel_name text,
+                property_type text,
                 property_type_guess text,
+                hotel_filter_reason text,
                 excluded_by_hotels_only_filter integer,
                 ota_hotel_id text,
                 star_rating real,
@@ -299,6 +339,11 @@ def _init_sqlite() -> None:
                 taxes_and_fees_text text,
                 checkin_date text,
                 checkout_date text,
+                requested_checkin_date text,
+                requested_checkout_date text,
+                effective_checkin_date text,
+                effective_checkout_date text,
+                date_integrity_verified integer,
                 number_of_nights integer,
                 adults integer,
                 hotel_url text,
@@ -343,7 +388,9 @@ def _ensure_sqlite_columns(conn: sqlite3.Connection) -> None:
     result_existing = {row["name"] for row in conn.execute("pragma table_info(hotel_price_results)").fetchall()}
     result_additions = {
         "raw_hotel_name": "text",
+        "property_type": "text",
         "property_type_guess": "text",
+        "hotel_filter_reason": "text",
         "excluded_by_hotels_only_filter": "integer",
         "raw_star_signal": "text",
         "star_aria_label": "text",
@@ -354,6 +401,11 @@ def _ensure_sqlite_columns(conn: sqlite3.Connection) -> None:
         "parsed_price": "real",
         "provider_name": "text",
         "raw_source_payload": "text",
+        "requested_checkin_date": "text",
+        "requested_checkout_date": "text",
+        "effective_checkin_date": "text",
+        "effective_checkout_date": "text",
+        "date_integrity_verified": "integer",
     }
     for column, column_type in result_additions.items():
         if column not in result_existing:

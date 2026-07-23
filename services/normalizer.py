@@ -16,7 +16,9 @@ RESULT_FIELDS = [
     "search_url",
     "hotel_name",
     "raw_hotel_name",
+    "property_type",
     "property_type_guess",
+    "hotel_filter_reason",
     "excluded_by_hotels_only_filter",
     "ota_hotel_id",
     "star_rating",
@@ -35,6 +37,11 @@ RESULT_FIELDS = [
     "taxes_and_fees_text",
     "checkin_date",
     "checkout_date",
+    "requested_checkin_date",
+    "requested_checkout_date",
+    "effective_checkin_date",
+    "effective_checkout_date",
+    "date_integrity_verified",
     "number_of_nights",
     "adults",
     "hotel_url",
@@ -124,21 +131,26 @@ def clean_hotel_name(raw_name: Any) -> str | None:
 
 
 def property_type_guess(name: Any, card_text: Any = None) -> str:
-    haystack = f"{name or ''} {card_text or ''}".lower()
-    if any(re.search(pattern, haystack, re.I) for pattern in HOTEL_POSITIVE_PATTERNS):
-        return "probable_hotel"
-    if any(re.search(pattern, haystack, re.I) for pattern in RENTAL_NEGATIVE_PATTERNS):
-        return "probable_vacation_rental_or_private_accommodation"
-    return "unknown"
+    from services.hotel_classifier import classify_booking_property
+
+    classification = classify_booking_property(
+        hotel_name=name,
+        card_text=card_text,
+    )
+    return (
+        "probable_hotel"
+        if classification.is_hotel_eligible
+        else "probable_vacation_rental_or_private_accommodation"
+    )
 
 
 def is_probable_hotel(name: Any, card_text: Any = None) -> bool:
-    guess = property_type_guess(name, card_text)
-    if guess == "probable_hotel":
-        return True
-    if guess == "probable_vacation_rental_or_private_accommodation":
-        return False
-    return True
+    from services.hotel_classifier import classify_booking_property
+
+    return classify_booking_property(
+        hotel_name=name,
+        card_text=card_text,
+    ).is_hotel_eligible
 
 
 def _to_decimal(value: Any) -> Decimal | None:
@@ -280,6 +292,17 @@ def normalize_hotel_result(raw_result: dict[str, Any]) -> dict[str, Any]:
     normalized["cheapest_price_total"] = parse_price_to_decimal(raw_result.get("cheapest_price_total")) or parsed_price
     normalized["checkin_date"] = checkin_date
     normalized["checkout_date"] = checkout_date
+    normalized["requested_checkin_date"] = (
+        raw_result.get("requested_checkin_date") or checkin_date
+    )
+    normalized["requested_checkout_date"] = (
+        raw_result.get("requested_checkout_date") or checkout_date
+    )
+    normalized["effective_checkin_date"] = raw_result.get("effective_checkin_date")
+    normalized["effective_checkout_date"] = raw_result.get("effective_checkout_date")
+    normalized["date_integrity_verified"] = bool(
+        raw_result.get("date_integrity_verified")
+    )
     normalized["number_of_nights"] = number_of_nights
     normalized["adults"] = int(raw_result.get("adults") or 2)
     normalized["provider_name"] = raw_result.get("provider_name") or raw_result.get("source")

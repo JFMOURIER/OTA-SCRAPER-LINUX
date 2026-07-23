@@ -228,6 +228,55 @@ def _network_property(result: dict[str, Any]) -> dict[str, Any] | None:
             ),
         )
     )
+    structured_metadata = {
+        "accommodation_type": _first_path(
+            result,
+            (
+                ("basicPropertyData", "accommodationType"),
+                ("accommodationType",),
+            ),
+        ),
+        "property_class": _first_path(
+            result,
+            (
+                ("basicPropertyData", "propertyClass"),
+                ("propertyClass",),
+            ),
+        ),
+        "property_category": _first_path(
+            result,
+            (
+                ("basicPropertyData", "propertyCategory"),
+                ("propertyCategory",),
+                ("basicPropertyData", "propertyType"),
+                ("propertyType",),
+            ),
+        ),
+        "badges": _first_path(
+            result,
+            (
+                ("badges",),
+                ("basicPropertyData", "badges"),
+                ("labels",),
+            ),
+        ),
+        "entire_place": _first_path(
+            result,
+            (
+                ("isEntirePlace",),
+                ("basicPropertyData", "isEntirePlace"),
+                ("matchingUnits", "0", "isEntirePlace"),
+            ),
+        ),
+        "hosted_private": _first_path(
+            result,
+            (
+                ("isPrivateHost",),
+                ("basicPropertyData", "isPrivateHost"),
+                ("hostedBy",),
+            ),
+        ),
+    }
     room_name = _display_text(_first_path(result, (
         ("blocks", "0", "roomName"),
         ("blocks", "0", "blockConfiguration", "name"),
@@ -250,6 +299,7 @@ def _network_property(result: dict[str, Any]) -> dict[str, Any] | None:
         "review_score": review_score,
         "review_count": review_count,
         "property_type": property_type,
+        "structured_metadata": structured_metadata,
         "room_name": room_name,
         "taxes_and_fees_text": taxes_and_fees,
     }

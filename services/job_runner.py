@@ -20,6 +20,9 @@ DATE_TERMINAL_STATUSES = {
     "stopped_by_user",
     "stopped_resource_limit",
     "completed_target_reached",
+    "completed_verified_end_of_results",
+    "completed_max_scroll_time_with_results",
+    "completed_verified_plateau",
     "completed_results_exhausted",
     "completed_pagination_plateau",
     "completed_resource_safe_limit",
@@ -29,6 +32,9 @@ DATE_TERMINAL_STATUSES = {
 COMPLETED_DATE_STATUSES = {
     "completed",
     "completed_target_reached",
+    "completed_verified_end_of_results",
+    "completed_max_scroll_time_with_results",
+    "completed_verified_plateau",
     "completed_results_exhausted",
     "completed_pagination_plateau",
     "skipped_resume",
@@ -207,6 +213,20 @@ def update_checkpoint_date(
             "partial_file_path": (output_files or {}).get("partial_json"),
             "saved_to_sqlite": bool((output_files or {}).get("saved_to_sqlite")),
             "exported_to_excel": bool((output_files or {}).get("partial_excel")),
+            "requested_max_hotels": (metrics or {}).get("requested_max_hotels"),
+            "unique_hotels_collected": (metrics or {}).get(
+                "unique_hotels_collected"
+            ),
+            "shortfall": (metrics or {}).get("shortfall"),
+            "stop_reason": (metrics or {}).get("stop_reason")
+            or (metrics or {}).get("network_batch_stop_reason"),
+            "end_of_results_verified": bool(
+                (metrics or {}).get("end_of_results_verified")
+            ),
+            "max_scroll_time_reached": bool(
+                (metrics or {}).get("max_scroll_time_reached")
+                or (metrics or {}).get("maximum_scroll_time_reached")
+            ),
         }
     )
     if status == "skipped_resume" and previous_status:

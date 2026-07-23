@@ -31,6 +31,10 @@ from services.booking_network_batches import (
     save_continuation,
 )
 from services.booking_pagination import NORMAL_PAGE_SIZE, PaginationResults
+from services.booking_date_integrity import (
+    canonical_search_url,
+    evaluate_date_integrity,
+)
 from services.endurance import (
     IncrementalResultBuffer,
     bounded_dom_settings,
@@ -38,7 +42,13 @@ from services.endurance import (
     prepare_ephemeral_profile,
     profile_directory_size_mb,
 )
-from services.normalizer import clean_hotel_name, is_probable_hotel, parse_price_to_decimal, parse_star_rating, property_type_guess
+from services.hotel_classifier import classify_booking_property
+from services.normalizer import clean_hotel_name, parse_price_to_decimal, parse_star_rating
+from services.partial_policy import (
+    POLICY_DISABLED,
+    partial_load_decision,
+    read_partial_metadata,
+)
 from services.playwright_safe import (
     interruptible_page_wait,
     launch_managed_chromium_context,
@@ -441,6 +451,8 @@ class BookingPlaywrightCollector(BaseCollector):
                 "error_message": None,
                 "page_loaded": False,
                 "search_verified": False,
+                "date_integrity_verified": False,
+                "date_integrity_corrective_reloads": 0,
                 "sort_applied": False,
                 "hotel_cards_detected": 0,
             }
@@ -455,6 +467,7 @@ class BookingPlaywrightCollector(BaseCollector):
                 continuation = (
                     load_continuation(options.partial_dir, checkin_date)
                     if options.partial_dir
+                    and options.stats.get("partial_resume_accepted")
                     else None
                 )
                 results = self._limit_successful_results(
@@ -484,6 +497,9 @@ class BookingPlaywrightCollector(BaseCollector):
                         "completion_status": "completed_target_reached",
                         "network_batch_stop_reason": "target_reached_from_partial",
                         "final_stop_reason": "completed_target_reached",
+                        "requested_max_hotels": maximum,
+                        "shortfall": 0,
+                        "stop_reason": "target_reached_from_partial",
                         "browser_launch_skipped_for_partial_target": True,
                     }
                 )
@@ -665,6 +681,15 @@ class BookingPlaywrightCollector(BaseCollector):
                             self.log(log_callback, f"Direct search retry {retry_index} did not verify: {retry_exc}")
                     else:
                         raise last_verify_error
+                self._ensure_date_integrity(
+                    page,
+                    requested_checkin=checkin_date,
+                    requested_checkout=checkout_date,
+                    canonical_url=search_url,
+                    options=options,
+                    log_callback=log_callback,
+                    allow_corrective_reload=True,
+                )
                 options.stats["search_verified"] = True
                 self._apply_price_sort(page, search_url, screenshot_dir, options, screenshot_paths, log_callback)
                 results_url = page.url
@@ -679,6 +704,16 @@ class BookingPlaywrightCollector(BaseCollector):
                 else:
                     self.log(log_callback, "Hotels only filter disabled.")
 
+                self._ensure_date_integrity(
+                    page,
+                    requested_checkin=checkin_date,
+                    requested_checkout=checkout_date,
+                    canonical_url=search_url,
+                    options=options,
+                    log_callback=log_callback,
+                    allow_corrective_reload=True,
+                )
+                results_url = page.url
                 self._log_page_verification(page, city_or_region, log_callback)
                 self._wait_for_any_card_selector(page, log_callback)
 
@@ -697,6 +732,7 @@ class BookingPlaywrightCollector(BaseCollector):
                 step(0.42, "hotel cards detected", visible_card_count=card_count_before, current_hotel_card_count=card_count_before)
 
                 load_more_start = time.perf_counter()
+                options.stats["pagination_started_monotonic"] = load_more_start
                 step(0.45, "capturing bounded Booking network batches", visible_card_count=card_count_before)
                 results = self._collect_network_batches(
                     page=page,
@@ -1073,7 +1109,7 @@ class BookingPlaywrightCollector(BaseCollector):
         )
         try:
             page.keyboard.press("Escape")
-        except PlaywrightError:
+        except (AttributeError, PlaywrightError):
             pass
         self.log(log_callback, "Booking.com hidden search inputs applied for city, dates, adults, room count, and currency.")
 
@@ -1104,7 +1140,7 @@ class BookingPlaywrightCollector(BaseCollector):
                 locator.click(timeout=4000, force=True)
                 self.log(log_callback, success_message)
                 return True
-            except PlaywrightError:
+            except (AttributeError, PlaywrightError):
                 return False
 
     def _open_date_picker(self, page, log_callback: LogCallback | None) -> bool:
@@ -1363,8 +1399,118 @@ class BookingPlaywrightCollector(BaseCollector):
         self.log(log_callback, f"page contains requested city name: {'yes' if city_ok else 'no'}")
         self.log(log_callback, f"page contains hotels or properties: {'yes' if hotel_words else 'no'}")
         self.log(log_callback, f"page contains price symbols: {'yes' if price_symbols else 'no'}")
-        if not (city_ok and checkin_ok and checkout_ok):
-            raise RuntimeError("Booking.com search did not apply the requested city or dates.")
+        if not city_ok:
+            raise RuntimeError("Booking.com search did not apply the requested city.")
+
+    def _inspect_date_sources(self, page) -> dict[str, Any]:
+        try:
+            fields = page.evaluate(
+                r"""
+                () => {
+                    const values = (selector) => Array.from(document.querySelectorAll(selector))
+                        .map((element) => String(
+                            element.value || element.getAttribute("value") ||
+                            element.getAttribute("data-date") ||
+                            element.getAttribute("aria-label") || ""
+                        ).trim())
+                        .filter(Boolean);
+                    return {
+                        visible_checkin: values("input:not([type='hidden'])[name*='checkin' i], input:not([type='hidden'])[data-testid*='checkin' i]"),
+                        visible_checkout: values("input:not([type='hidden'])[name*='checkout' i], input:not([type='hidden'])[data-testid*='checkout' i]"),
+                        hidden_checkin: values("input[type='hidden'][name*='checkin' i]"),
+                        hidden_checkout: values("input[type='hidden'][name*='checkout' i]"),
+                    };
+                }
+                """
+            )
+        except PlaywrightError:
+            fields = {}
+        return {
+            "page_url": safe_page_url(page) or "",
+            "visible_checkin": list(fields.get("visible_checkin") or []),
+            "visible_checkout": list(fields.get("visible_checkout") or []),
+            "hidden_checkin": list(fields.get("hidden_checkin") or []),
+            "hidden_checkout": list(fields.get("hidden_checkout") or []),
+            "page_text": self._safe_body_text(page)[:50000],
+        }
+
+    def _ensure_date_integrity(
+        self,
+        page,
+        *,
+        requested_checkin: date,
+        requested_checkout: date,
+        canonical_url: str,
+        options: CollectorOptions,
+        log_callback: LogCallback | None,
+        allow_corrective_reload: bool,
+    ):
+        def inspect():
+            sources = self._inspect_date_sources(page)
+            return evaluate_date_integrity(
+                requested_checkin=requested_checkin,
+                requested_checkout=requested_checkout,
+                page_url=sources["page_url"],
+                visible_checkin_values=sources["visible_checkin"],
+                visible_checkout_values=sources["visible_checkout"],
+                hidden_checkin_values=sources["hidden_checkin"],
+                hidden_checkout_values=sources["hidden_checkout"],
+                collector_checkin=requested_checkin,
+                collector_checkout=requested_checkout,
+                status_checkin=options.stats.get("current_checkin_date"),
+                status_checkout=options.stats.get("current_checkout_date"),
+                page_text=sources.get("page_text") or "",
+                telemetry_url=str(options.stats.get("latest_url") or ""),
+            )
+
+        report = inspect()
+        reloads = int(options.stats.get("date_integrity_corrective_reloads") or 0)
+        if (
+            not report.date_integrity_verified
+            and allow_corrective_reload
+            and reloads < 1
+        ):
+            repaired_url = canonical_search_url(
+                canonical_url,
+                requested_checkin=requested_checkin,
+                requested_checkout=requested_checkout,
+            )
+            self.log(
+                log_callback,
+                "Date integrity mismatch detected; performing one canonical "
+                f"corrective reload: {','.join(report.mismatch_reasons)}",
+            )
+            options.stats["date_integrity_corrective_reloads"] = reloads + 1
+            page.goto(repaired_url, wait_until="domcontentloaded", timeout=45000)
+            if not interruptible_page_wait(
+                page,
+                1000 if options.fast_mode else 2000,
+                options.stop_event,
+            ):
+                raise RuntimeError(
+                    "stopped_by_user: cancelled during date integrity reload"
+                )
+            self._wait_for_results_page(page, log_callback)
+            report = inspect()
+
+        report_fields = report.as_dict()
+        options.stats.update(report_fields)
+        options.stats["effective_search_url"] = report.page_url
+        options.stats["latest_url"] = report.page_url
+        self.log(
+            log_callback,
+            "Booking date integrity: "
+            f"requested={report.requested_checkin_date}->{report.requested_checkout_date}, "
+            f"effective={report.effective_checkin_date}->{report.effective_checkout_date}, "
+            f"verified={'yes' if report.date_integrity_verified else 'no'}.",
+        )
+        self._notify_status(options, "date integrity checked", **report_fields)
+        if not report.date_integrity_verified:
+            raise RuntimeError(
+                "date_integrity_mismatch: "
+                + ", ".join(report.mismatch_reasons)
+            )
+        return report
 
     def _apply_price_sort(self, page, fallback_url: str, screenshot_dir: Path, options: CollectorOptions, screenshot_paths: list[Path], log_callback: LogCallback | None) -> None:
         applied = False
@@ -1679,6 +1825,7 @@ class BookingPlaywrightCollector(BaseCollector):
         continuation = (
             load_continuation(options.partial_dir, checkin_date)
             if options.resume_partial_results
+            and options.stats.get("partial_resume_accepted")
             else None
         )
         response_fingerprints = set(
@@ -1706,6 +1853,10 @@ class BookingPlaywrightCollector(BaseCollector):
                 "maximum_live_dom_cards": self._valid_card_count(page, selector),
                 "results_exhausted": False,
                 "filtered_out_records": 0,
+                "requested_max_hotels": maximum,
+                "shortfall": max(
+                    0, maximum - retained.successful_count()
+                ),
             }
         )
         filtered_total = 0
@@ -1731,6 +1882,13 @@ class BookingPlaywrightCollector(BaseCollector):
             status: str = "incomplete_network_batches",
         ) -> None:
             values = retained.values()
+            options.stats["requested_max_hotels"] = maximum
+            options.stats["unique_hotels_collected"] = (
+                retained.successful_count()
+            )
+            options.stats["shortfall"] = max(
+                0, maximum - retained.successful_count()
+            )
             metadata = {
                 "network_batch_offset": batch_offset,
                 "network_batch_next_offset": next_offset,
@@ -1803,10 +1961,30 @@ class BookingPlaywrightCollector(BaseCollector):
             options.stats["completion_status"] = status
             options.stats["network_batch_stop_reason"] = reason
             options.stats["results_exhausted"] = (
-                status == "completed_results_exhausted"
+                status == "completed_verified_end_of_results"
             )
             options.stats["final_stop_reason"] = status
             options.stats["actual_parse_failures"] = parse_failures
+            options.stats["requested_max_hotels"] = maximum
+            options.stats["unique_hotels_collected"] = retained.successful_count()
+            options.stats["shortfall"] = max(
+                0, maximum - retained.successful_count()
+            )
+            options.stats["stop_reason"] = reason
+            options.stats["end_of_results_verified"] = bool(
+                options.stats.get("end_of_results_verified")
+                or status == "completed_verified_end_of_results"
+            )
+            options.stats["max_scroll_time_reached"] = bool(
+                options.stats.get("maximum_scroll_time_reached")
+            )
+            if retained.successful_count() < maximum:
+                options.stats["collection_completeness_warning"] = (
+                    "Booking collection stopped below the requested maximum: "
+                    f"requested={maximum}, collected={retained.successful_count()}, "
+                    f"shortfall={maximum - retained.successful_count()}, "
+                    f"reason={reason}."
+                )
             persist(
                 next_offset=next_offset,
                 rows_per_page=rows_per_page,
@@ -1930,7 +2108,7 @@ class BookingPlaywrightCollector(BaseCollector):
                 self._bottom_visible_text(page)
             )
             if bootstrap_count < NORMAL_PAGE_SIZE or explicit_end:
-                options.stats["completion_status"] = "completed_results_exhausted"
+                options.stats["completion_status"] = "completed_verified_end_of_results"
                 options.stats["network_batch_stop_reason"] = (
                     "short_bootstrap" if bootstrap_count < NORMAL_PAGE_SIZE else explicit_end
                 )
@@ -1940,7 +2118,7 @@ class BookingPlaywrightCollector(BaseCollector):
                     rows_per_page=NORMAL_PAGE_SIZE,
                     batch_offset=None,
                     added=0,
-                    status="completed_results_exhausted",
+                    status="completed_verified_end_of_results",
                 )
                 return self._limit_successful_results(retained.values(), maximum)
             options.stats["completion_status"] = (
@@ -2152,7 +2330,7 @@ class BookingPlaywrightCollector(BaseCollector):
         if retained.successful_count() >= maximum:
             completion = "completed_target_reached"
         elif captured_batch.proves_exhaustion:
-            completion = "completed_results_exhausted"
+            completion = "completed_verified_end_of_results"
         else:
             completion = ""
 
@@ -2253,7 +2431,7 @@ class BookingPlaywrightCollector(BaseCollector):
             if retained.successful_count() >= maximum:
                 completion = "completed_target_reached"
             elif batch.proves_exhaustion:
-                completion = "completed_results_exhausted"
+                completion = "completed_verified_end_of_results"
 
         options.stats["completion_status"] = completion
         options.stats["network_batch_stop_reason"] = (
@@ -2262,7 +2440,7 @@ class BookingPlaywrightCollector(BaseCollector):
             else "server_pagination_exhausted"
         )
         options.stats["results_exhausted"] = (
-            completion == "completed_results_exhausted"
+            completion == "completed_verified_end_of_results"
         )
         options.stats["final_stop_reason"] = completion
         options.stats["actual_parse_failures"] = parse_failures
@@ -2295,20 +2473,53 @@ class BookingPlaywrightCollector(BaseCollector):
         screenshot_path: Path | None,
         reason: str,
     ) -> str:
-        """Try at most two visible-DOM cycles, then accept a usable plateau."""
+        """Continue visible pagination until a target or verified stop condition."""
 
-        max_attempts = 2
+        no_growth_required = max(
+            3,
+            int(os.getenv("OTA_BOOKING_PLATEAU_VERIFICATION_CYCLES", "3")),
+        )
+        started = float(
+            options.stats.get("pagination_started_monotonic")
+            or time.perf_counter()
+        )
+        deadline = started + max(1, int(options.max_scroll_minutes)) * 60
         screenshot_paths: list[Path] = []
         attempt_rows: list[dict[str, Any]] = []
+        consecutive_network_no_growth = int(
+            options.stats.get("consecutive_network_no_growth") or 1
+        )
+        consecutive_dom_no_growth = 0
+        consecutive_missing_load_more = 0
+        consecutive_duplicate_fingerprints = int(
+            options.stats.get("network_batch_duplicate_fingerprints_ignored") or 0
+        )
+        consecutive_visible_no_growth = 0
+        last_visible_card_count = self._valid_card_count(page, selector)
+        try:
+            last_page_height = int(
+                page.evaluate(
+                    "() => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)"
+                )
+                or 0
+            )
+        except (AttributeError, PlaywrightError):
+            last_page_height = 0
         options.stats["network_dom_fallback_trigger"] = reason
-        options.stats["network_dom_fallback_max_attempts"] = max_attempts
+        options.stats["network_dom_fallback_plateau_cycles_required"] = (
+            no_growth_required
+        )
         self.log(
             log_callback,
             "Booking network pagination made no unique progress; attempting "
-            f"up to {max_attempts} bounded visible-DOM fallback cycles.",
+            "adaptive visible-DOM pagination within the configured scroll time.",
         )
 
-        for attempt in range(1, max_attempts + 1):
+        attempt = 0
+        while True:
+            attempt += 1
+            now = time.perf_counter()
+            elapsed = max(0.0, now - started)
             before = retained.successful_count()
             if before >= maximum:
                 options.stats["network_batch_stop_reason"] = (
@@ -2317,34 +2528,60 @@ class BookingPlaywrightCollector(BaseCollector):
                 options.stats["network_dom_fallback_attempts"] = attempt - 1
                 options.stats["network_dom_fallback_cycles"] = attempt_rows
                 return "completed_target_reached"
+            if self.should_stop(options):
+                raise RuntimeError(
+                    "stopped_by_user: cancelled during Booking DOM pagination"
+                )
+            if now >= deadline:
+                if before <= 0:
+                    raise PaginationUnsupportedError(
+                        "Booking maximum scroll time reached with zero usable records."
+                    )
+                options.stats["maximum_scroll_time_reached"] = True
+                options.stats["network_batch_stop_reason"] = (
+                    "configured_maximum_scroll_time_reached"
+                )
+                options.stats["end_of_results_verified"] = False
+                return "completed_max_scroll_time_with_results"
 
             current_count = self._valid_card_count(page, selector)
             options.stats["maximum_live_dom_cards"] = max(
                 int(options.stats.get("maximum_live_dom_cards") or 0),
                 current_count,
             )
-            visible_rows = self._bulk_extract_cards(
-                page,
-                selector,
-                current_count,
-                city_or_region,
-                base_url,
-                checkin_date,
-                checkout_date,
-                number_of_nights,
-                adults,
-                currency,
-                screenshot_path,
-                log_callback,
-                options,
-                ranking_offset=0,
+            if attempt == 1 or current_count < last_visible_card_count:
+                current_start = 0
+            elif current_count > last_visible_card_count:
+                current_start = last_visible_card_count
+            else:
+                current_start = current_count
+            visible_rows = (
+                self._bulk_extract_cards(
+                    page,
+                    selector,
+                    current_count,
+                    city_or_region,
+                    base_url,
+                    checkin_date,
+                    checkout_date,
+                    number_of_nights,
+                    adults,
+                    currency,
+                    screenshot_path,
+                    log_callback,
+                    options,
+                    start_card=current_start,
+                    ranking_offset=0,
+                )
+                if current_start < current_count
+                else []
             )
             visible_rows = filter_rows(visible_rows)
             visible_rows = self._limit_successful_results(
                 visible_rows,
                 max(0, maximum - retained.successful_count()),
             )
-            retained.add(visible_rows)
+            extract_diagnostics = retained.add_with_diagnostics(visible_rows)
             after_extract = retained.successful_count()
             if after_extract >= maximum:
                 attempt_rows.append(
@@ -2355,6 +2592,8 @@ class BookingPlaywrightCollector(BaseCollector):
                         "unique_before": before,
                         "unique_after": after_extract,
                         "new_unique": after_extract - before,
+                        **extract_diagnostics,
+                        "elapsed_pagination_seconds": round(elapsed, 2),
                     }
                 )
                 options.stats["network_dom_fallback_attempts"] = attempt
@@ -2364,6 +2603,17 @@ class BookingPlaywrightCollector(BaseCollector):
                     "target_reached_during_dom_fallback"
                 )
                 return "completed_target_reached"
+            if time.perf_counter() >= deadline:
+                if after_extract <= 0:
+                    raise PaginationUnsupportedError(
+                        "Booking maximum scroll time reached with zero usable records."
+                    )
+                options.stats["maximum_scroll_time_reached"] = True
+                options.stats["network_batch_stop_reason"] = (
+                    "configured_maximum_scroll_time_reached"
+                )
+                options.stats["end_of_results_verified"] = False
+                return "completed_max_scroll_time_with_results"
 
             explicit_end = self._detect_end_of_results_text(
                 self._bottom_visible_text(page)
@@ -2378,6 +2628,8 @@ class BookingPlaywrightCollector(BaseCollector):
                         "unique_after": after_extract,
                         "new_unique": after_extract - before,
                         "end_of_results": explicit_end,
+                        **extract_diagnostics,
+                        "elapsed_pagination_seconds": round(elapsed, 2),
                     }
                 )
                 options.stats["network_dom_fallback_attempts"] = attempt
@@ -2386,7 +2638,8 @@ class BookingPlaywrightCollector(BaseCollector):
                 options.stats["network_batch_stop_reason"] = (
                     "end_of_results_during_dom_fallback"
                 )
-                return "completed_results_exhausted"
+                options.stats["end_of_results_verified"] = True
+                return "completed_verified_end_of_results"
 
             loaded = self.click_load_more_results(
                 page,
@@ -2417,6 +2670,7 @@ class BookingPlaywrightCollector(BaseCollector):
                 screenshot_path,
                 log_callback,
                 options,
+                start_card=current_count if next_count >= current_count else 0,
                 ranking_offset=0,
             )
             next_rows = filter_rows(next_rows)
@@ -2424,8 +2678,46 @@ class BookingPlaywrightCollector(BaseCollector):
                 next_rows,
                 max(0, maximum - retained.successful_count()),
             )
-            retained.add(next_rows)
+            next_diagnostics = retained.add_with_diagnostics(next_rows)
             after = retained.successful_count()
+            new_unique = after - before
+            raw_parsed = int(extract_diagnostics["raw_records_parsed"]) + int(
+                next_diagnostics["raw_records_parsed"]
+            )
+            duplicate_identities = int(
+                extract_diagnostics["duplicate_identities"]
+            ) + int(next_diagnostics["duplicate_identities"])
+            identity_collisions = int(
+                extract_diagnostics["identity_collisions"]
+            ) + int(next_diagnostics["identity_collisions"])
+            try:
+                page_height = int(
+                    page.evaluate(
+                        "() => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)"
+                    )
+                    or 0
+                )
+            except (AttributeError, PlaywrightError):
+                page_height = last_page_height
+            visible_progress = (
+                next_count > last_visible_card_count
+                or page_height > last_page_height
+            )
+            if new_unique > 0:
+                consecutive_network_no_growth = 0
+                consecutive_dom_no_growth = 0
+                consecutive_missing_load_more = 0
+                consecutive_visible_no_growth = 0
+            else:
+                consecutive_dom_no_growth += 1
+                consecutive_missing_load_more = (
+                    0 if loaded else consecutive_missing_load_more + 1
+                )
+                consecutive_visible_no_growth = (
+                    0
+                    if visible_progress
+                    else consecutive_visible_no_growth + 1
+                )
             attempt_rows.append(
                 {
                     "attempt": attempt,
@@ -2434,16 +2726,58 @@ class BookingPlaywrightCollector(BaseCollector):
                     "load_more_succeeded": bool(loaded),
                     "unique_before": before,
                     "unique_after": after,
-                    "new_unique": after - before,
+                    "new_unique": new_unique,
+                    "raw_records_parsed": raw_parsed,
+                    "eligible_records_parsed": len(visible_rows)
+                    + len(next_rows),
+                    "duplicate_identities": duplicate_identities,
+                    "identity_collisions": identity_collisions,
+                    "partial_records_already_present": duplicate_identities,
+                    "network_offset": options.stats.get("network_batch_offset"),
+                    "response_fingerprint": (
+                        (options.stats.get(
+                            "network_batch_response_fingerprints"
+                        ) or [None])[-1]
+                    ),
+                    "page_height_before": last_page_height,
+                    "page_height_after": page_height,
+                    "elapsed_pagination_seconds": round(
+                        time.perf_counter() - started, 2
+                    ),
                 }
             )
+            last_visible_card_count = next_count
+            last_page_height = page_height
             options.stats["network_dom_fallback_attempts"] = attempt
             options.stats["network_dom_fallback_cycles"] = attempt_rows
             options.stats["unique_hotels_collected"] = after
+            options.stats["consecutive_network_no_growth"] = (
+                consecutive_network_no_growth
+            )
+            options.stats["consecutive_dom_no_growth"] = (
+                consecutive_dom_no_growth
+            )
+            options.stats["consecutive_missing_load_more"] = (
+                consecutive_missing_load_more
+            )
+            options.stats["consecutive_duplicate_response_fingerprints"] = (
+                consecutive_duplicate_fingerprints
+            )
+            options.stats["last_unique_count"] = after
+            options.stats["last_visible_card_count"] = next_count
+            options.stats["last_page_height"] = page_height
+            options.stats["pagination_identity_collisions"] = sum(
+                int(row.get("identity_collisions") or 0)
+                for row in attempt_rows
+            )
             self.log(
                 log_callback,
-                f"Booking DOM fallback {attempt}/{max_attempts}: "
-                f"cards={current_count}->{next_count}, unique={before}->{after}.",
+                "Booking DOM pagination cycle "
+                f"{attempt}: cards={current_count}->{next_count}, "
+                f"raw={raw_parsed}, eligible={len(visible_rows) + len(next_rows)}, "
+                f"new_identities={new_unique}, duplicates={duplicate_identities}, "
+                f"collisions={identity_collisions}, unique={before}->{after}, "
+                f"elapsed={time.perf_counter() - started:.1f}s.",
             )
             if after >= maximum:
                 options.stats["network_batch_stop_reason"] = (
@@ -2459,20 +2793,36 @@ class BookingPlaywrightCollector(BaseCollector):
                 options.stats["network_batch_stop_reason"] = (
                     "end_of_results_during_dom_fallback"
                 )
-                return "completed_results_exhausted"
+                options.stats["end_of_results_verified"] = True
+                return "completed_verified_end_of_results"
 
-        if retained.successful_count() <= 0:
-            raise PaginationUnsupportedError(
-                "Booking pagination plateau produced zero usable hotel records."
+            displayed_total = int(
+                options.stats.get("booking_visible_result_count") or 0
             )
-        options.stats["network_batch_stop_reason"] = (
-            "pagination_plateau_after_bounded_dom_fallback"
-        )
-        options.stats["collection_completeness_warning"] = (
-            "Booking pagination plateaued after two bounded DOM fallback cycles; "
-            "all usable unique results were retained."
-        )
-        return "completed_pagination_plateau"
+            if displayed_total > 0 and after >= displayed_total:
+                options.stats["network_batch_stop_reason"] = (
+                    "booking_displayed_total_reached"
+                )
+                options.stats["end_of_results_verified"] = True
+                return "completed_verified_end_of_results"
+
+            plateau_verified = (
+                consecutive_dom_no_growth >= no_growth_required
+                and (
+                    consecutive_missing_load_more >= no_growth_required
+                    or consecutive_visible_no_growth >= no_growth_required
+                )
+            )
+            if plateau_verified:
+                if retained.successful_count() <= 0:
+                    raise PaginationUnsupportedError(
+                        "Booking pagination plateau produced zero usable hotel records."
+                    )
+                options.stats["network_batch_stop_reason"] = (
+                    "verified_no_growth_without_actionable_load_more_progress"
+                )
+                options.stats["end_of_results_verified"] = False
+                return "completed_verified_plateau"
 
     def _capture_booking_network_batch(
         self,
@@ -2671,11 +3021,24 @@ class BookingPlaywrightCollector(BaseCollector):
             name = clean_hotel_name(raw.get("hotel_name"))
             price = raw.get("price_text")
             star = parse_star_rating(raw.get("star_rating"))
+            classification = classify_booking_property(
+                hotel_name=name,
+                structured_metadata=raw.get("structured_metadata")
+                or raw.get("property_type"),
+            )
             compact_payload = {
                 "property_id": raw.get("property_id"),
                 "page_name": raw.get("page_name"),
                 "property_type": raw.get("property_type"),
+                "structured_metadata": raw.get("structured_metadata"),
                 "network_batch_offset": batch.offset,
+                "date_integrity": {
+                    "requested_checkin_date": checkin_date.isoformat(),
+                    "requested_checkout_date": checkout_date.isoformat(),
+                    "effective_checkin_date": checkin_date.isoformat(),
+                    "effective_checkout_date": checkout_date.isoformat(),
+                    "date_integrity_verified": True,
+                },
             }
             rows.append(
                 {
@@ -2684,10 +3047,14 @@ class BookingPlaywrightCollector(BaseCollector):
                     "search_url": search_url,
                     "hotel_name": name,
                     "raw_hotel_name": name,
-                    "property_type_guess": property_type_guess(
-                        name,
-                        raw.get("property_type"),
+                    "property_type": classification.property_type
+                    or raw.get("property_type"),
+                    "property_type_guess": (
+                        "probable_hotel"
+                        if classification.is_hotel_eligible
+                        else "probable_vacation_rental_or_private_accommodation"
                     ),
+                    "hotel_filter_reason": classification.classification_reason,
                     "excluded_by_hotels_only_filter": False,
                     "ota_hotel_id": raw.get("property_id"),
                     "star_rating": star,
@@ -2714,6 +3081,11 @@ class BookingPlaywrightCollector(BaseCollector):
                     ),
                     "checkin_date": checkin_date,
                     "checkout_date": checkout_date,
+                    "requested_checkin_date": checkin_date,
+                    "requested_checkout_date": checkout_date,
+                    "effective_checkin_date": checkin_date,
+                    "effective_checkout_date": checkout_date,
+                    "date_integrity_verified": True,
                     "number_of_nights": number_of_nights,
                     "adults": adults,
                     "hotel_url": raw.get("hotel_url"),
@@ -2753,12 +3125,30 @@ class BookingPlaywrightCollector(BaseCollector):
         options: CollectorOptions,
         log_callback: LogCallback | None,
     ) -> list[dict[str, object]]:
+        policy = str(options.partial_resume_policy or POLICY_DISABLED)
         if not options.resume_partial_results or not options.partial_dir:
+            options.stats["partial_resume_accepted"] = False
+            if options.partial_dir:
+                self.log(log_callback, "Partial rejected: resume disabled")
             return []
         path = Path(options.partial_dir) / f"{stay_date.isoformat()}_partial_hotels.json"
+        metadata = read_partial_metadata(Path(options.partial_dir), stay_date)
+        decision = partial_load_decision(
+            policy=policy,
+            expected_fingerprint=options.partial_fingerprint,
+            metadata=metadata,
+            current_job_id=options.partial_job_id,
+            current_run_id=options.partial_run_id,
+        )
+        options.stats["partial_resume_accepted"] = decision.allowed
+        options.stats["partial_resume_decision"] = decision.log_message
+        self.log(log_callback, decision.log_message)
+        if not decision.allowed:
+            return []
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
+            options.stats["partial_resume_accepted"] = False
             return []
         if not isinstance(payload, list):
             return []
@@ -4151,6 +4541,20 @@ class BookingPlaywrightCollector(BaseCollector):
                     };
                     const priceText = findPriceText(card) || clean(priceEl?.innerText || priceEl?.textContent);
                     const roomEl = card.querySelector("[data-testid='recommended-units'] h4, h4");
+                    const propertyTypeEl = card.querySelector(
+                        "[data-testid*='property-type' i], " +
+                        "[data-testid*='accommodation-type' i], " +
+                        "[data-testid='property-card-unit-configuration'], " +
+                        "[aria-label*='property type' i]"
+                    );
+                    const structuredMetadata = {
+                        property_type_text: clean(propertyTypeEl?.innerText || propertyTypeEl?.getAttribute("aria-label")),
+                        property_type_id: card.getAttribute("data-property-type-id"),
+                        accommodation_type: card.getAttribute("data-accommodation-type"),
+                        entire_place: card.getAttribute("data-entire-place"),
+                        badges: Array.from(card.querySelectorAll("[data-testid*='badge' i], [class*='badge' i]"))
+                            .slice(0, 12).map((el) => clean(el.innerText || el.textContent)).filter(Boolean),
+                    };
                     const text = clean(card.innerText);
                     const star = parseStar(card);
                     rows.push({
@@ -4162,6 +4566,7 @@ class BookingPlaywrightCollector(BaseCollector):
                         raw_price_text: priceText,
                         cheapest_price_total: priceText,
                         raw_card_text: text,
+                        structured_metadata: structuredMetadata,
                         star_rating: star.rating,
                         raw_star_signal: star.raw,
                         star_aria_label: star.aria,
@@ -4184,13 +4589,24 @@ class BookingPlaywrightCollector(BaseCollector):
             key = raw.get("hotel_url") or name
             if not key or key in seen:
                 continue
+            classification = classify_booking_property(
+                hotel_name=name,
+                structured_metadata=raw.get("structured_metadata"),
+                card_text=raw.get("raw_card_text"),
+            )
             row = {
                 "source": self.source_name,
                 "city_or_region": city_or_region,
                 "search_url": search_url,
                 "hotel_name": name,
                 "raw_hotel_name": raw_name,
-                "property_type_guess": property_type_guess(name, raw.get("raw_card_text")),
+                "property_type": classification.property_type,
+                "property_type_guess": (
+                    "probable_hotel"
+                    if classification.is_hotel_eligible
+                    else "probable_vacation_rental_or_private_accommodation"
+                ),
+                "hotel_filter_reason": classification.classification_reason,
                 "excluded_by_hotels_only_filter": False,
                 "ota_hotel_id": None,
                 "star_rating": raw.get("star_rating"),
@@ -4211,6 +4627,17 @@ class BookingPlaywrightCollector(BaseCollector):
                 "raw_source_payload": json.dumps(raw, ensure_ascii=True, default=str),
                 "checkin_date": checkin_date,
                 "checkout_date": checkout_date,
+                "requested_checkin_date": checkin_date,
+                "requested_checkout_date": checkout_date,
+                "effective_checkin_date": date.fromisoformat(
+                    str(options.stats.get("effective_checkin_date") or checkin_date)
+                ),
+                "effective_checkout_date": date.fromisoformat(
+                    str(options.stats.get("effective_checkout_date") or checkout_date)
+                ),
+                "date_integrity_verified": bool(
+                    options.stats.get("date_integrity_verified")
+                ),
                 "number_of_nights": number_of_nights,
                 "adults": adults,
                 "hotel_url": raw.get("hotel_url"),
@@ -4277,13 +4704,23 @@ class BookingPlaywrightCollector(BaseCollector):
             if missing_reason:
                 self.log(log_callback, f"Star rating missing reason: {missing_reason}")
 
+        classification = classify_booking_property(
+            hotel_name=name,
+            card_text=card_text,
+        )
         return {
             "source": self.source_name,
             "city_or_region": city_or_region,
             "search_url": search_url,
             "hotel_name": name,
             "raw_hotel_name": raw_name,
-            "property_type_guess": property_type_guess(name, card_text),
+            "property_type": classification.property_type,
+            "property_type_guess": (
+                "probable_hotel"
+                if classification.is_hotel_eligible
+                else "probable_vacation_rental_or_private_accommodation"
+            ),
+            "hotel_filter_reason": classification.classification_reason,
             "excluded_by_hotels_only_filter": False,
             "ota_hotel_id": None,
             "star_rating": star_rating,
@@ -4304,6 +4741,11 @@ class BookingPlaywrightCollector(BaseCollector):
             "raw_source_payload": card_text,
             "checkin_date": checkin_date,
             "checkout_date": checkout_date,
+            "requested_checkin_date": checkin_date,
+            "requested_checkout_date": checkout_date,
+            "effective_checkin_date": checkin_date,
+            "effective_checkout_date": checkout_date,
+            "date_integrity_verified": True,
             "number_of_nights": number_of_nights,
             "adults": adults,
             "hotel_url": link,
@@ -4471,20 +4913,40 @@ class BookingPlaywrightCollector(BaseCollector):
             return results
         kept: list[dict] = []
         removed: list[dict] = []
+        reason_counts: dict[str, int] = {}
         for row in results:
             name = row.get("hotel_name")
-            card_text = row.get("raw_hotel_name") or name
             if row.get("collection_status") != "success" or not name:
                 row["excluded_by_hotels_only_filter"] = True
+                row["hotel_filter_reason"] = "missing_usable_hotel_record"
                 removed.append(row)
                 continue
-            if is_probable_hotel(name, card_text):
+            classification = classify_booking_property(
+                hotel_name=name,
+                structured_metadata=row.get("property_type"),
+                card_text=row.get("raw_source_payload")
+                or row.get("raw_hotel_name"),
+            )
+            row["property_type"] = (
+                row.get("property_type") or classification.property_type
+            )
+            row["property_type_guess"] = (
+                "probable_hotel"
+                if classification.is_hotel_eligible
+                else "probable_vacation_rental_or_private_accommodation"
+            )
+            row["hotel_filter_reason"] = classification.classification_reason
+            reason_counts[classification.classification_reason] = (
+                reason_counts.get(classification.classification_reason, 0) + 1
+            )
+            if classification.is_hotel_eligible:
                 kept.append(row)
             else:
                 row["excluded_by_hotels_only_filter"] = True
                 removed.append(row)
         options.stats["records_after_hotels_only_filter"] = int(options.stats.get("records_after_hotels_only_filter", 0)) + len(kept)
         options.stats["hotels_only_removed"] = int(options.stats.get("hotels_only_removed", 0)) + len(removed)
+        options.stats["hotel_filter_reason_counts"] = reason_counts
         self.log(log_callback, f"raw records extracted: {raw_count}")
         self.log(log_callback, f"records kept after hotels only filter: {len(kept)}")
         self.log(log_callback, f"records removed as vacation rental or private accommodation: {len(removed)}")

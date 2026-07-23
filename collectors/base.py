@@ -46,6 +46,10 @@ class CollectorOptions:
     partial_results_callback: PartialResultsCallback | None = None
     partial_dir: Path | None = None
     resume_partial_results: bool = False
+    partial_resume_policy: str = "disabled"
+    partial_fingerprint: dict[str, Any] | None = None
+    partial_job_id: str | None = None
+    partial_run_id: int | None = None
     resource_check_callback: Callable[[], tuple[str, dict[str, object]]] | None = None
     current_attempt: int = 1
     stats: dict[str, object] = field(default_factory=dict)

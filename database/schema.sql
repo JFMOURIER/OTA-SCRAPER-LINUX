@@ -31,7 +31,9 @@ create table if not exists hotel_price_results (
     search_url text null,
     hotel_name text null,
     raw_hotel_name text null,
+    property_type text null,
     property_type_guess text null,
+    hotel_filter_reason text null,
     excluded_by_hotels_only_filter boolean null,
     ota_hotel_id text null,
     star_rating numeric null,
@@ -48,6 +50,11 @@ create table if not exists hotel_price_results (
     taxes_and_fees_text text null,
     checkin_date date not null,
     checkout_date date not null,
+    requested_checkin_date date null,
+    requested_checkout_date date null,
+    effective_checkin_date date null,
+    effective_checkout_date date null,
+    date_integrity_verified boolean null,
     number_of_nights integer not null,
     adults integer not null,
     hotel_url text null,
@@ -67,7 +74,13 @@ alter table hotel_price_results
     add column if not exists raw_hotel_name text;
 
 alter table hotel_price_results
+    add column if not exists property_type text;
+
+alter table hotel_price_results
     add column if not exists property_type_guess text;
+
+alter table hotel_price_results
+    add column if not exists hotel_filter_reason text;
 
 alter table hotel_price_results
     add column if not exists excluded_by_hotels_only_filter boolean;
@@ -92,6 +105,21 @@ alter table hotel_price_results
 
 alter table hotel_price_results
     add column if not exists raw_source_payload text;
+
+alter table hotel_price_results
+    add column if not exists requested_checkin_date date;
+
+alter table hotel_price_results
+    add column if not exists requested_checkout_date date;
+
+alter table hotel_price_results
+    add column if not exists effective_checkin_date date;
+
+alter table hotel_price_results
+    add column if not exists effective_checkout_date date;
+
+alter table hotel_price_results
+    add column if not exists date_integrity_verified boolean;
 
 create index if not exists idx_hotel_price_results_source
     on hotel_price_results(source);

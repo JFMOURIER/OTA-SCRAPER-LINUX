@@ -45,6 +45,7 @@ from database.db import (
     get_connection,
     init_db,
     insert_hotel_results,
+    result_aggregates_by_run_id,
     result_date_counts_by_run_id,
     reset_sqlite_database,
     sqlite_wal_checkpoint,
@@ -80,6 +81,15 @@ from services.job_runner import (
 from services.normalizer import normalize_hotel_result
 from services.playwright_safe import launch_managed_chromium_context, safe_close_browser, safe_screenshot
 from services.partial_recovery import recover_checkpoint_status_failures
+from services.partial_policy import (
+    POLICY_DISABLED,
+    POLICY_EXPLICIT,
+    POLICY_SAME_JOB,
+    build_partial_metadata,
+    partial_load_decision,
+    read_partial_metadata,
+    write_partial_metadata,
+)
 from services.resource_guard import (
     ResourceGuard,
     ResourceLimitExceeded,
@@ -119,8 +129,32 @@ WORKER_STOP_GRACE_SECONDS = 8.0
 MAX_UI_RESULTS = 500
 BOOKING_COMPLETED_DATE_STATUSES = {
     "completed_target_reached",
+    "completed_verified_end_of_results",
+    "completed_max_scroll_time_with_results",
+    "completed_verified_plateau",
+    # Legacy statuses remain readable for existing checkpoints.
     "completed_results_exhausted",
     "completed_pagination_plateau",
+}
+TERMINAL_RUN_STATUSES = {
+    "completed",
+    "completed_all_dates",
+    "completed_with_failed_dates",
+    "completed_with_blocked_dates",
+    "completed_with_partial_results",
+    "completed_with_zero_results",
+    "completed_incomplete",
+    "stopped",
+    "stopped_by_user",
+    "stopped_by_user_with_partial_results",
+    "stopped_resource_limit",
+    "browser_crash",
+    "application_exception",
+    "refused_second_scraper",
+    "fatal_error_with_partial_results",
+    "failed",
+    "fatal_startup_error",
+    "fatal_config_error",
 }
 
 
@@ -1072,6 +1106,86 @@ def price_validation_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def should_show_stale_heartbeat_warning(status: str, stale: bool) -> bool:
+    return bool(stale and status not in TERMINAL_RUN_STATUSES)
+
+
+def validate_booking_records_for_persistence(
+    rows: list[dict[str, Any]],
+    *,
+    expected_checkin: date,
+    expected_checkout: date,
+) -> None:
+    expected_in = expected_checkin.isoformat()
+    expected_out = expected_checkout.isoformat()
+    mismatched = [
+        row
+        for row in rows
+        if not bool(row.get("date_integrity_verified"))
+        or str(row.get("effective_checkin_date") or "") != expected_in
+        or str(row.get("effective_checkout_date") or "") != expected_out
+    ]
+    if mismatched:
+        raise RuntimeError(
+            "date_integrity_mismatch: refusing to persist "
+            f"{len(mismatched)} Booking records whose effective dates "
+            "do not match the planned stay."
+        )
+
+
+def final_status_metrics(
+    *,
+    planned_dates: list[date],
+    number_of_nights: int,
+    date_status_rows: list[dict[str, Any]],
+    aggregates: dict[str, Any],
+    preview_rows: int,
+) -> dict[str, Any]:
+    completed_date_count = sum(
+        1
+        for row in date_status_rows
+        if str(row.get("status") or "") in {
+            "completed",
+            "skipped_resume",
+            *BOOKING_COMPLETED_DATE_STATUSES,
+        }
+    )
+    final_checkin = planned_dates[-1].isoformat() if planned_dates else None
+    final_checkout = (
+        calculate_checkout_date(
+            planned_dates[-1], number_of_nights
+        ).isoformat()
+        if planned_dates
+        else None
+    )
+    return {
+        "current_stay_index": len(planned_dates),
+        "total_stay_dates": len(planned_dates),
+        "completed_stay_dates": completed_date_count,
+        "current_checkin_date": final_checkin,
+        "current_checkout_date": final_checkout,
+        "hotels_collected_total": int(
+            aggregates.get("total_observations") or 0
+        ),
+        "total_observations": int(
+            aggregates.get("total_observations") or 0
+        ),
+        "preview_rows_shown": int(preview_rows),
+        "unique_hotels": int(aggregates.get("unique_hotels") or 0),
+        "rows_with_raw_price": int(
+            aggregates.get("rows_with_raw_price") or 0
+        ),
+        "rows_with_parsed_price": int(
+            aggregates.get("rows_with_parsed_price") or 0
+        ),
+        "rows_missing_price": int(
+            aggregates.get("rows_missing_price") or 0
+        ),
+        "estimated_remaining_seconds": 0,
+        "estimated_remaining_time": "Completed",
+    }
+
+
 def write_price_pipeline_debug(stay_date: date, results: list[dict[str, Any]]) -> Path:
     rows = []
     for row in results[:30]:
@@ -1529,7 +1643,10 @@ def collector_options_kwargs(config: CollectionConfig, stop_event: Event | None 
         "instance_data_dir": INSTANCE_CONFIG.data_dir,
         "browser_profile_dir": BROWSER_PROFILE_DIR / "jobs" / f"worker_{os.getpid()}" / ("headless" if config.headless else "visible"),
         "partial_dir": PARTIAL_DIR,
-        "resume_partial_results": True,
+        "resume_partial_results": config.resume_previous_run,
+        "partial_resume_policy": (
+            POLICY_EXPLICIT if config.resume_previous_run else POLICY_DISABLED
+        ),
         "current_attempt": attempt,
     }
 
@@ -1586,6 +1703,29 @@ def job_signature(config: CollectionConfig) -> dict[str, Any]:
     return {"source":config.source,"city":config.city_or_region.strip().lower(),"start":config.checkin_start.isoformat(),"end":config.checkin_end.isoformat(),"nights":config.nights,"adults":config.adults,"currency":config.currency,"max_hotels":config.max_hotels,"stars":list(config.selected_star_ratings),"unknown_stars":config.include_unknown_star_rating,"hotels_only":config.hotels_only,"collect_all":config.collect_all_available,"performance":config.performance_mode,"headless":config.headless}
 def job_signature_hash(config: CollectionConfig) -> str:
     return hashlib.sha256(json.dumps(job_signature(config),sort_keys=True,separators=(",",":")).encode()).hexdigest()
+
+
+def partial_fingerprint_for(
+    config: CollectionConfig,
+    stay_date: date,
+) -> dict[str, Any]:
+    return {
+        "instance_id": INSTANCE_CONFIG.instance_id,
+        "source": config.source,
+        "city_or_destination_id": config.city_or_region.strip().lower(),
+        "checkin": stay_date.isoformat(),
+        "checkout": calculate_checkout_date(stay_date, config.nights).isoformat(),
+        "stay_length": config.nights,
+        "adults": config.adults,
+        "rooms": 1,
+        "currency": config.currency.upper(),
+        "selected_star_ratings": list(config.selected_star_ratings),
+        "include_unknown_star_rating": config.include_unknown_star_rating,
+        "hotels_only": config.hotels_only,
+        "collect_all": config.collect_all_available,
+        "maximum_hotels": config.max_hotels,
+        "sort_order": "price",
+    }
 
 
 def saved_date_counts(results: list[dict[str, Any]]) -> dict[str, int]:
@@ -2106,12 +2246,26 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
 
     def progress(value: float, message: str) -> None:
         snapshot = guard.check()
+        elapsed = max(0.001, time.perf_counter() - perf_start)
+        hotels_per_minute = round(saved_count / elapsed * 60, 2)
+        expected_total = (
+            len(planned_dates) * max(1, int(config.max_hotels))
+            if not config.collect_all_available
+            else None
+        )
+        remaining_seconds = (
+            round(max(0, expected_total - saved_count) / hotels_per_minute * 60)
+            if expected_total and hotels_per_minute > 0
+            else None
+        )
         put_progress(queue, value, message)
         put_metrics(queue, {**snapshot.as_dict(), "resource_guard_level": guard.last_level})
         update_status_file(
             progress_percent=round(value * 100, 2),
             current_message=message,
-            elapsed_seconds=round(time.perf_counter() - perf_start, 2),
+            elapsed_seconds=round(elapsed, 2),
+            hotels_collected_per_minute=hotels_per_minute,
+            estimated_remaining_seconds=remaining_seconds,
             **snapshot.as_dict(),
         )
 
@@ -2163,10 +2317,42 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
             "__date_status_rows": date_status_rows,
         }
         summary = create_summary(normalized_results, run_metadata)
-        summary["total_records"] = saved_count
+        aggregates = (
+            result_aggregates_by_run_id(run_id, backend=config.db_backend)
+            if run_id is not None
+            else {}
+        )
+        authoritative_total = int(
+            aggregates.get("total_observations") or saved_count
+        )
+        summary["total_records"] = authoritative_total
+        summary["total hotels collected"] = authoritative_total
+        summary["total observations"] = authoritative_total
+        summary["unique hotels"] = int(aggregates.get("unique_hotels") or 0)
+        summary["number of successful records"] = int(
+            aggregates.get("successful_records") or 0
+        )
+        summary["number of failed records"] = int(
+            aggregates.get("failed_records") or 0
+        )
+        summary["lowest price"] = aggregates.get("minimum_price")
+        summary["highest price"] = aggregates.get("maximum_price")
         summary["results retained in worker memory"] = len(normalized_results)
+        summary["preview rows shown"] = len(normalized_results)
         summary["__date_status_rows"] = date_status_rows
-        summary.update(price_validation_summary(normalized_results))
+        summary.update(
+            {
+                "rows_with_raw_price": int(
+                    aggregates.get("rows_with_raw_price") or 0
+                ),
+                "rows_with_parsed_price": int(
+                    aggregates.get("rows_with_parsed_price") or 0
+                ),
+                "rows_missing_price": int(
+                    aggregates.get("rows_missing_price") or 0
+                ),
+            }
+        )
         return summary
 
     def write_endurance_summary(status: str, error: str | None = None) -> Path:
@@ -2219,6 +2405,23 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
         options = CollectorOptions(**collector_options_kwargs(config, stop_event, attempt=attempt))
         partial_seen_keys: set[str] = set()
         job_token = safe_filename(str(getattr(queue, "job_id", None) or f"worker_{os.getpid()}"))
+        if config.resume_previous_run:
+            options.partial_resume_policy = POLICY_EXPLICIT
+        elif attempt > 1:
+            options.partial_resume_policy = POLICY_SAME_JOB
+        else:
+            options.partial_resume_policy = POLICY_DISABLED
+        options.resume_partial_results = (
+            options.partial_resume_policy != POLICY_DISABLED
+        )
+        options.partial_fingerprint = partial_fingerprint_for(config, stay_date)
+        options.partial_job_id = str(getattr(queue, "job_id", None) or job_token)
+        options.partial_run_id = run_id
+        options.partial_dir = (
+            PARTIAL_DIR / "runs" / f"run_{int(run_id)}"
+            if run_id is not None
+            else PARTIAL_DIR / "runs" / job_token
+        )
         # One short-lived profile per date/attempt prevents service workers,
         # IndexedDB, caches, and GPU state from accumulating for a year-long
         # run. Historical profiles are preserved; cleanup never deletes them.
@@ -2250,7 +2453,21 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
         def partial_results_callback(stay_date: date, records: list[dict[str, Any]], metadata: dict[str, Any]) -> None:
             if not records:
                 return
-            paths = save_partial_records(PARTIAL_DIR, stay_date, records)
+            paths = save_partial_records(
+                Path(options.partial_dir), stay_date, records
+            )
+            partial_metadata = build_partial_metadata(
+                partial_fingerprint_for(config, stay_date),
+                job_id=options.partial_job_id,
+                run_id=run_id,
+                collector_version="booking_playwright_v2",
+            )
+            metadata_path = write_partial_metadata(
+                Path(options.partial_dir),
+                stay_date,
+                partial_metadata,
+            )
+            paths["metadata"] = str(metadata_path.resolve())
             if run_id is not None:
                 persistable: list[dict[str, Any]] = []
                 checkout_date = calculate_checkout_date(stay_date, config.nights)
@@ -2296,6 +2513,7 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
                     "partial_json_path": paths["json"],
                     "partial_csv_path": paths["csv"],
                     "partial_records_saved": paths["records"],
+                    "partial_metadata_path": paths["metadata"],
                     **metadata,
                 }
             )
@@ -2316,8 +2534,18 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
         nonlocal saved_count
         if not is_booking_source(config.source):
             raw_results = filter_results_by_star_rating(raw_results, options, queue)
+        else:
+            validate_booking_records_for_persistence(
+                raw_results,
+                expected_checkin=stay_date,
+                expected_checkout=checkout_date,
+            )
         date_results = [normalize_hotel_result({**row, "collection_run_id": run_id_value}) for row in raw_results]
-        partial_paths = save_partial_records(PARTIAL_DIR, stay_date, date_results)
+        partial_paths = save_partial_records(
+            Path(options.partial_dir or PARTIAL_DIR),
+            stay_date,
+            date_results,
+        )
         if date_results:
             log(f"Saving {len(date_results)} records for {stay_date.isoformat()} to {config.db_backend}.")
             db_save_start = time.perf_counter()
@@ -2416,21 +2644,48 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
             log(f"New run created: {run_id}")
         queue.put(("run_id", run_id))
         queue.put(("records_saved", saved_count))
-        recovered_partials = recover_checkpoint_status_failures(
-            checkpoint,
-            planned_dates=planned_dates,
-            partial_dir=PARTIAL_DIR,
-            run_id=run_id,
-            source=config.source,
-            city_or_region=config.city_or_region,
-            number_of_nights=config.nights,
-            adults=config.adults,
-            currency=config.currency,
-            backend=config.db_backend,
-            dry_run=False,
-            log=log,
-            strict=False,
+        run_partial_dir = PARTIAL_DIR / "runs" / f"run_{int(run_id)}"
+        recoverable_dates: list[date] = []
+        if config.resume_previous_run:
+            for candidate_date in planned_dates:
+                decision = partial_load_decision(
+                    policy=POLICY_EXPLICIT,
+                    expected_fingerprint=partial_fingerprint_for(
+                        config, candidate_date
+                    ),
+                    metadata=read_partial_metadata(
+                        run_partial_dir, candidate_date
+                    ),
+                    current_job_id=str(getattr(queue, "job_id", None) or ""),
+                    current_run_id=run_id,
+                )
+                log(decision.log_message)
+                if decision.allowed:
+                    recoverable_dates.append(candidate_date)
+        recovered_partials = (
+            recover_checkpoint_status_failures(
+                checkpoint,
+                planned_dates=recoverable_dates,
+                partial_dir=run_partial_dir,
+                run_id=run_id,
+                source=config.source,
+                city_or_region=config.city_or_region,
+                number_of_nights=config.nights,
+                adults=config.adults,
+                currency=config.currency,
+                backend=config.db_backend,
+                dry_run=False,
+                log=log,
+                strict=False,
+            )
+            if config.resume_previous_run
+            else []
         )
+        if not config.resume_previous_run:
+            log(
+                "Partial rejected: resume disabled; prior partial files and "
+                "checkpoint-status recovery were not loaded."
+            )
         if recovered_partials:
             saved_count = count_results_by_run_id(run_id, backend=config.db_backend)
             normalized_results = fetch_results_by_run_id_limited(
@@ -2503,6 +2758,14 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
             current_base = (date_index - 1) / max(len(planned_dates), 1)
             progress(current_base * 0.86 + 0.03, f"Collecting {config.source}: {date_key} to {checkout_date.isoformat()}")
             log(f"Starting date {date_index} of {len(planned_dates)}: {date_key}")
+            update_status_file(
+                current_stay_index=date_index,
+                total_stay_dates=len(planned_dates),
+                completed_stay_dates=max(0, date_index - 1),
+                current_checkin_date=date_key,
+                current_checkout_date=checkout_date.isoformat(),
+                hotels_collected_current_date=0,
+            )
             checkpoint = update_checkpoint_date(
                 checkpoint,
                 stay_date=stay_date,
@@ -2603,6 +2866,9 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
                     push_date_rows(checkpoint)
                     date_completed = date_status in {
                         "completed",
+                        "completed_verified_end_of_results",
+                        "completed_max_scroll_time_with_results",
+                        "completed_verified_plateau",
                         "completed_target_reached",
                         "completed_results_exhausted",
                         "completed_pagination_plateau",
@@ -2644,6 +2910,9 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
                                 "completed",
                                 "completed_partial",
                                 "completed_target_reached",
+                                "completed_verified_end_of_results",
+                                "completed_max_scroll_time_with_results",
+                                "completed_verified_plateau",
                                 "completed_results_exhausted",
                                 "completed_pagination_plateau",
                                 "completed_resource_safe_limit",
@@ -2783,7 +3052,36 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
         checkpoint.setdefault("output_files", {})["final_csv_status"] = csv_payload.get("csv_export_status")
         save_checkpoint(checkpoint)
         queue.put(("complete", {"results": normalized_results, "summary": summary, "excel_file_path": str(final_excel_path), "status": status, **csv_payload}))
-        update_status_file(status=status, progress_percent=100.0, current_message=f"Collection finished: {status}", latest_excel_file=str(final_excel_path), **csv_payload, **price_validation_summary(normalized_results))
+        final_aggregates = result_aggregates_by_run_id(
+            run_id, backend=config.db_backend
+        )
+        authoritative_status_metrics = final_status_metrics(
+            planned_dates=planned_dates,
+            number_of_nights=config.nights,
+            date_status_rows=date_status_rows,
+            aggregates=final_aggregates,
+            preview_rows=len(normalized_results),
+        )
+        final_checkin = authoritative_status_metrics[
+            "current_checkin_date"
+        ]
+        latest_effective_url = (
+            str(options.stats.get("effective_search_url") or "")
+            if "options" in locals()
+            else ""
+        )
+        update_status_file(
+            status=status,
+            progress_percent=100.0,
+            current_message=f"Collection finished: {status}",
+            latest_excel_file=str(final_excel_path),
+            latest_url=latest_effective_url or None,
+            latest_url_date=final_checkin,
+            latest_url_is_diagnostic_history=False,
+            last_error=None,
+            **csv_payload,
+            **authoritative_status_metrics,
+        )
         log(f"Database run status updated: {status}")
         log(f"Endurance summary written: {endurance_path}")
         log(f"Excel file created: {final_excel_path}")
@@ -3457,30 +3755,24 @@ def render_job_status() -> None:
     metric_cols[2].metric("Card count", metrics.get("visible_card_count") or metrics.get("current_hotel_card_count", "-"))
     metric_cols[3].metric("Elapsed", metrics.get("elapsed_seconds", metrics.get("elapsed_time", "-")))
     metric_cols[4].metric("Remaining", metrics.get("estimated_remaining_seconds", metrics.get("estimated_remaining_time", "-")))
-    terminal_statuses = {
-        "completed",
-        "completed_all_dates",
-        "completed_with_failed_dates",
-        "completed_with_blocked_dates",
-        "completed_with_partial_results",
-        "completed_with_zero_results",
-        "completed_incomplete",
-        "stopped_by_user",
-        "stopped_by_user_with_partial_results",
-        "stopped_resource_limit",
-        "browser_crash",
-        "application_exception",
-        "refused_second_scraper",
-        "fatal_error_with_partial_results",
-        "failed",
-        "fatal_startup_error",
-        "fatal_config_error",
-    }
+    terminal_statuses = TERMINAL_RUN_STATUSES
     if status in terminal_statuses:
         rows_collected = metrics.get("hotels_collected_total")
         if rows_collected is None:
             rows_collected = st.session_state.csv_rows_exported or st.session_state.records_saved or len(st.session_state.results)
         st.write(f"Rows collected: {rows_collected}")
+        st.write(
+            "Total observations: "
+            f"{metrics.get('total_observations', rows_collected)}"
+        )
+        st.write(
+            "Preview rows shown: "
+            f"{metrics.get('preview_rows_shown', len(st.session_state.results))}"
+        )
+        completed_dates = metrics.get("completed_stay_dates")
+        total_dates = metrics.get("total_stay_dates")
+        if completed_dates is not None and total_dates is not None:
+            st.write(f"Completed dates: {completed_dates} of {total_dates}")
         csv_status = metrics.get("csv_export_status") or st.session_state.csv_export_status
         csv_path = metrics.get("csv_file_path") or st.session_state.csv_file_path
         csv_error = metrics.get("csv_export_error") or st.session_state.csv_export_error
@@ -3499,7 +3791,9 @@ def render_job_status() -> None:
         st.write(f"Latest screenshot path: {metrics.get('latest_screenshot_path')}")
     if metrics.get("last_error"):
         st.warning(f"Latest error: {metrics.get('last_error')}")
-    if heartbeat_is_stale(HEARTBEAT_FILE):
+    if should_show_stale_heartbeat_warning(
+        status, heartbeat_is_stale(HEARTBEAT_FILE)
+    ):
         st.warning(
             "Warning: scraper heartbeat is stale. The process may have stopped. "
             "Partial results should be available in the partial and exports folders."
