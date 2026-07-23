@@ -15,6 +15,7 @@ ProgressCallback = Callable[[float, str], None]
 LogCallback = Callable[[str], None]
 StatusCallback = Callable[[dict[str, Any]], None]
 PartialResultsCallback = Callable[[date, list[dict[str, Any]], dict[str, Any]], None]
+ResourceCheckCallback = Callable[[], tuple[str, dict[str, Any]]]
 
 
 @dataclass(slots=True)
@@ -44,8 +45,10 @@ class CollectorOptions:
     browser_profile_dir: Path | None = None
     status_callback: StatusCallback | None = None
     partial_results_callback: PartialResultsCallback | None = None
+    resource_check_callback: ResourceCheckCallback | None = None
     partial_dir: Path | None = None
     current_attempt: int = 1
+    resume_partial_results: bool = False
     stats: dict[str, object] = field(default_factory=dict)
 
 

@@ -25,6 +25,18 @@ class FatalScraperConfigError(ScraperError):
     reason = "fatal_config"
 
 
+class ResourcePressureError(ScraperError):
+    reason = "resource_pressure"
+
+    def __init__(self, message: str, *, level: str = "soft") -> None:
+        super().__init__(message)
+        self.level = level
+
+
+class PaginationUnsupportedError(ScraperError):
+    reason = "pagination_unsupported"
+
+
 BROWSER_CLOSED_TOKENS = (
     "target page, context or browser has been closed",
     "browser has been closed",

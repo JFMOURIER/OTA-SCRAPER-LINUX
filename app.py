@@ -61,6 +61,7 @@ from services.job_runner import (
     final_run_status,
     heartbeat_is_stale,
     load_checkpoint,
+    proven_completed_dates,
     save_partial_records,
     should_export_snapshot,
     update_checkpoint_date,
@@ -71,6 +72,7 @@ from services.scraper_errors import (
     AccessRestrictionError,
     BrowserClosedError,
     FatalScraperConfigError,
+    ResourcePressureError,
     classify_scraper_error,
     is_browser_closed_error,
 )
@@ -1347,6 +1349,7 @@ def collector_options_kwargs(config: CollectionConfig, stop_event: Event | None 
         "browser_profile_dir": (BROWSER_PROFILE_DIR / "browser_profile_headless") if config.headless and is_booking_source(config.source) else BROWSER_PROFILE_DIR,
         "partial_dir": PARTIAL_DIR,
         "current_attempt": attempt,
+        "resume_partial_results": bool(config.resume_previous_run or attempt > 1),
     }
 
 
@@ -1396,16 +1399,7 @@ def saved_date_counts(results: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def completed_dates_from_checkpoint_and_db(checkpoint: dict[str, Any], counts: dict[str, int]) -> set[str]:
-    completed = set(str(value) for value in checkpoint.get("completed_dates") or [])
-    date_statuses = checkpoint.get("date_statuses") or {}
-    for date_key, count in counts.items():
-        row = date_statuses.get(date_key)
-        if isinstance(row, dict):
-            if row.get("status") in {"completed", "completed_partial", "skipped_resume"} and count > 0:
-                completed.add(date_key)
-        elif count > 0:
-            completed.add(date_key)
-    return completed
+    return proven_completed_dates(checkpoint, counts)
 
 
 def run_collection_job(config: CollectionConfig, stop_event: Event, queue: Queue) -> None:
@@ -1850,6 +1844,7 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Event, qu
     last_log_message = "Preparing collection run"
     last_snapshot_time = time.monotonic()
     fatal_error: str | None = None
+    resource_limited = False
     run_id: int | None = None
     checkpoint_path = _checkpoint_path(config)
     current_checkpoint_path = CHECKPOINT_DIR / "current_run_resume.json"
@@ -2184,6 +2179,25 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Event, qu
                         lambda value, message, base=current_base: progress(min(0.90, base * 0.86 + value / max(len(planned_dates), 1) * 0.86), message),
                         log,
                     )
+                    completion_status = str(options.stats.get("completion_status") or "")
+                    if (
+                        is_booking_source(config.source)
+                        and completion_status
+                        not in {
+                            "completed_target_reached",
+                            "completed_results_exhausted",
+                        }
+                    ):
+                        raise RuntimeError(
+                            "Booking date did not prove target reached or results exhausted: "
+                            f"{completion_status or 'missing completion status'}"
+                        )
+                    if not is_booking_source(config.source):
+                        completion_status = (
+                            "completed_target_reached"
+                            if raw_results
+                            else "completed_results_exhausted"
+                        )
                     date_results, output_files = save_current_date_results(
                         stay_date=stay_date,
                         checkout_date=checkout_date,
@@ -2197,7 +2211,7 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Event, qu
                         checkpoint,
                         stay_date=stay_date,
                         checkout_date=checkout_date,
-                        status="completed" if date_results else "completed_partial",
+                        status=completion_status,
                         attempts=attempt,
                         records_collected=len(date_results),
                         output_files=output_files,
@@ -2207,13 +2221,51 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Event, qu
                     push_date_rows(checkpoint)
                     completed_dates.add(date_key)
                     date_completed = True
-                    log(f"Date completed: {date_key}; records collected: {len(date_results)}")
-                    completed_count = len([row for row in date_status_rows if row.get("status") in {"completed", "completed_partial", "skipped_resume"}])
+                    log(
+                        f"Date completed: {date_key}; reason={completion_status}; "
+                        f"records collected: {len(date_results)}"
+                    )
+                    completed_count = len(
+                        [
+                            row
+                            for row in date_status_rows
+                            if row.get("status")
+                            in {
+                                "completed_target_reached",
+                                "completed_results_exhausted",
+                                "skipped_resume",
+                            }
+                        ]
+                    )
                     if retry_settings.auto_export_partial_excel and should_export_snapshot(completed_count, last_snapshot_time, retry_settings.partial_export_frequency):
                         export_partial("running", snapshot=True)
                         last_snapshot_time = time.monotonic()
                     break
                 except Exception as exc:
+                    if isinstance(exc, ResourcePressureError):
+                        last_error = str(exc)
+                        resource_limited = True
+                        log(
+                            f"Resource-safe pagination stop for {date_key}: "
+                            f"{exc.level}: {last_error}"
+                        )
+                        checkpoint = update_checkpoint_date(
+                            checkpoint,
+                            stay_date=stay_date,
+                            checkout_date=checkout_date,
+                            status="stopped_resource_limit",
+                            attempts=attempt,
+                            records_collected=0,
+                            error=last_error,
+                            output_files={
+                                "partial_json": options.stats.get("partial_json_path"),
+                                "partial_csv": options.stats.get("partial_csv_path"),
+                            },
+                            metrics=options.stats,
+                        )
+                        save_checkpoint(checkpoint)
+                        push_date_rows(checkpoint)
+                        break
                     classified = classify_scraper_error(exc)
                     last_error = str(classified)
                     if is_browser_closed_error(exc):
@@ -2272,6 +2324,8 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Event, qu
                     if not retry_settings.continue_if_date_fails:
                         fatal_error = last_error
                         raise
+            if resource_limited:
+                break
             if stop_event.is_set() and not date_completed:
                 checkpoint = update_checkpoint_date(
                     checkpoint,
@@ -2286,6 +2340,27 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Event, qu
                 push_date_rows(checkpoint)
                 break
             progress(date_index / max(len(planned_dates), 1), f"Finished date {date_index} of {len(planned_dates)}")
+
+        if resource_limited:
+            status = "stopped_resource_limit"
+            update_collection_run_status(run_id, status, last_error, backend=config.db_backend)
+            checkpoint["status"] = status
+            save_checkpoint(checkpoint)
+            queue.put(("failed", {"status": status, "error": last_error}))
+            update_status_file(
+                status=status,
+                current_message="Collection preserved for resource-safe resume",
+                last_error=last_error,
+            )
+            update_heartbeat(
+                HEARTBEAT_FILE,
+                job_id=getattr(queue, "job_id", None),
+                instance_id=INSTANCE_CONFIG.instance_id,
+                current_date=None,
+                status=status,
+                last_log_message=last_error,
+            )
+            return
 
         status = final_run_status(date_status_rows, stop_event.is_set(), fatal_error)
         summary = build_summary(status)

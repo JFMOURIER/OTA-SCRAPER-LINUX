@@ -5,3 +5,4 @@ openpyxl
 xlsxwriter
 psycopg[binary]
 python-dotenv
+psutil>=5.9,<8

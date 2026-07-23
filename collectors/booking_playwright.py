@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import traceback
@@ -14,10 +15,25 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from collectors.base import BaseCollector, CollectorOptions, LogCallback, ProgressCallback
+from services.booking_pagination import (
+    NORMAL_PAGE_SIZE,
+    PaginationResults,
+    evaluate_pagination_resources,
+    hotel_identity,
+    next_resume_offset,
+    pagination_resource_snapshot,
+    url_with_offset,
+)
 from services.date_utils import calculate_checkout_date, format_timestamp_for_filename
 from services.normalizer import clean_hotel_name, is_probable_hotel, parse_price_to_decimal, parse_star_rating, property_type_guess
 from services.playwright_safe import safe_close_browser, safe_page_title, safe_page_url, safe_screenshot
-from services.scraper_errors import AccessRestrictionError, BrowserClosedError, is_browser_closed_error
+from services.scraper_errors import (
+    AccessRestrictionError,
+    BrowserClosedError,
+    PaginationUnsupportedError,
+    ResourcePressureError,
+    is_browser_closed_error,
+)
 
 
 def extract_booking_star_rating(card) -> int | None:
@@ -380,6 +396,15 @@ class BookingPlaywrightCollector(BaseCollector):
                 "unique_results_loaded_path": None,
                 "booking_result_count_difference": None,
                 "collection_completeness_warning": None,
+                "pagination_offsets_visited": [],
+                "pagination_page_card_counts": [],
+                "pagination_page_unique_additions": [],
+                "pagination_dom_replaced": True,
+                "pagination_max_offset": 0,
+                "pagination_stop_reason": None,
+                "peak_browser_rss_mb": 0.0,
+                "peak_browser_pss_mb": 0.0,
+                "minimum_available_ram_mb": None,
                 "unexpected_new_pages_closed": 0,
                 "unexpected_property_navigation_count": 0,
                 "hotel_records_extracted": 0,
@@ -539,92 +564,36 @@ class BookingPlaywrightCollector(BaseCollector):
                     return []
 
                 card_count_before = self._valid_card_count(page, selector)
-                self.log(log_callback, f"Hotel card count before scrolling: {card_count_before}")
+                self.log(log_callback, f"Hotel card count on offset 0: {card_count_before}")
                 self._screenshot(page, screenshot_dir, "booking_first_cards", options, screenshot_paths, log_callback)
                 step(0.42, "hotel cards detected", visible_card_count=card_count_before, current_hotel_card_count=card_count_before)
 
-                load_more_start = time.perf_counter()
-                step(0.45, "scrolling", visible_card_count=card_count_before)
-                final_count = self._progressive_scroll(page, selector, max_hotels, options, progress_callback, log_callback, screenshot_dir, screenshot_paths, results_url)
-                options.stats["load_more_time_seconds"] = round(float(options.stats.get("load_more_time_seconds", 0)) + (time.perf_counter() - load_more_start), 2)
+                step(0.45, "collecting bounded Booking result pages", visible_card_count=card_count_before)
+                results = self._collect_offset_pages(
+                    page=page,
+                    selector=selector,
+                    base_url=page.url or results_url or search_url,
+                    city_or_region=city_or_region,
+                    checkin_date=checkin_date,
+                    checkout_date=checkout_date,
+                    number_of_nights=number_of_nights,
+                    adults=adults,
+                    currency=currency,
+                    max_hotels=max_hotels,
+                    options=options,
+                    progress_callback=progress_callback,
+                    log_callback=log_callback,
+                    screenshot_path=screenshot_paths[-1] if screenshot_paths else None,
+                )
+                final_count = len(results)
                 options.stats["final_cards_found"] = final_count
-                self.log(log_callback, f"Hotel card count after scrolling: {final_count}")
-                self._screenshot(page, screenshot_dir, "booking_final_scroll", options, screenshot_paths, log_callback)
-                step(0.55, "final Load more cycle complete", visible_card_count=final_count, current_hotel_card_count=final_count, load_more_clicks=options.stats.get("load_more_clicks", 0))
-
-                cards = self._valid_cards(page, selector)
-                if not options.collect_all_available:
-                    cards = cards[: int(max_hotels)]
-                self._write_card_debug(cards[:10], debug_dir, options, log_callback)
-                self.log(log_callback, "No property page clicks allowed during scraping.")
-
-                self.log(log_callback, f"Hotel records extracted before filtering: starting extraction from {len(cards)} cards.")
-                step(0.60, "extracting hotels", visible_card_count=len(cards))
-                extraction_start = time.perf_counter()
-                try:
-                    results = self._bulk_extract_cards(
-                        page,
-                        selector,
-                        len(cards),
-                        city_or_region,
-                        search_url,
-                        checkin_date,
-                        checkout_date,
-                        number_of_nights,
-                        adults,
-                        currency,
-                        screenshot_paths[-1] if screenshot_paths else None,
-                        log_callback,
-                        options,
-                    )
-                    self.progress(progress_callback, 0.90, f"Processed {len(results)} Booking.com cards")
-                except Exception as exc:
-                    self.log(log_callback, f"Bulk card extraction failed, falling back to per-card extraction: {exc}")
-                    for index, card in enumerate(cards, start=1):
-                        self._ensure_results_page(page, results_url, options, log_callback)
-                        if self.should_stop(options):
-                            self.log(log_callback, "Stop requested while extracting Booking.com cards.")
-                            break
-                        try:
-                            result = self._extract_card(
-                                card,
-                                index,
-                                city_or_region,
-                                search_url,
-                                checkin_date,
-                                checkout_date,
-                                number_of_nights,
-                                adults,
-                                currency,
-                                screenshot_paths[-1] if screenshot_paths else None,
-                                log_callback,
-                            )
-                            results.append(result)
-                        except Exception as card_exc:
-                            self.log(log_callback, f"Card {index}: extraction failed: {card_exc}")
-                            results.append(self._failed_result(card_exc, city_or_region, search_url, checkin_date, checkout_date, number_of_nights, adults, currency, index, screenshot_paths[-1] if screenshot_paths else None))
-                        self.progress(progress_callback, 0.55 + (index / max(len(cards), 1)) * 0.35, f"Processed Booking.com card {index} of {len(cards)}")
-                options.stats["extraction_time_seconds"] = round(float(options.stats.get("extraction_time_seconds", 0)) + (time.perf_counter() - extraction_start), 2)
-                options.stats["unique_hotels_collected"] = len({(row.get("hotel_url") or clean_hotel_name(row.get("hotel_name"))) for row in results if row.get("hotel_name")})
-
-                self.log(log_callback, f"Hotel records extracted before filtering: {len(results)}")
+                self.log(log_callback, f"Bounded pagination retained {final_count} final records.")
                 options.stats["hotel_records_extracted"] = len(results)
                 options.stats["hotels_extracted"] = len(results)
                 options.stats["final_extracted_hotel_count"] = len(results)
-                if options.disable_filters_during_complete_collection:
-                    self.log(log_callback, "Complete collection test: post-collection hotels-only and star filters skipped.")
-                    options.stats["records_after_hotels_only_filter"] = len(results)
-                    options.stats["hotels_only_removed"] = 0
-                    options.stats["hotels_with_known_star_rating"] = sum(1 for row in results if row.get("star_rating") is not None)
-                    options.stats["hotels_with_unknown_star_rating"] = sum(1 for row in results if row.get("star_rating") is None)
-                    options.stats["hotels_removed_by_star_filter"] = 0
-                    options.stats["hotels_kept_after_star_filter"] = len(results)
-                else:
-                    results = self._filter_hotels_only(results, options, log_callback)
-                    results = self._filter_by_star_rating(results, options, log_callback)
                 options.stats["hotels_kept_after_filters"] = len(results)
                 options.stats["hotels_removed_by_hotels_only_filter"] = int(options.stats.get("hotels_only_removed", 0))
-                self.log(log_callback, f"Hotel records after filtering: {len(results)}")
+                self.progress(progress_callback, 0.90, f"Processed {len(results)} unique Booking.com hotels")
 
                 if not results:
                     self._screenshot(page, screenshot_dir, "booking_zero_results_after_filter", options, screenshot_paths, log_callback)
@@ -646,6 +615,14 @@ class BookingPlaywrightCollector(BaseCollector):
                         if "blocked_or_access_restricted" in error_message
                         else "incomplete_unknown_reason"
                     )
+                if isinstance(exc, ResourcePressureError):
+                    self._notify_status(
+                        options,
+                        error_message,
+                        status="stopped_resource_limit",
+                        last_error=error_message,
+                    )
+                    raise
                 self._screenshot(page, screenshot_dir, "booking_error", options, screenshot_paths, log_callback)
                 update_headless_startup(last_url_opened=getattr(page, "url", None), last_error=error_message)
                 if options.headless:
@@ -1502,6 +1479,320 @@ class BookingPlaywrightCollector(BaseCollector):
                 continue
         return valid
 
+    def _collect_offset_pages(
+        self,
+        *,
+        page,
+        selector: str,
+        base_url: str,
+        city_or_region: str,
+        checkin_date: date,
+        checkout_date: date,
+        number_of_nights: int,
+        adults: int,
+        currency: str,
+        max_hotels: int,
+        options: CollectorOptions,
+        progress_callback: ProgressCallback | None,
+        log_callback: LogCallback | None,
+        screenshot_path: Path | None,
+    ) -> list[dict]:
+        """Extract one small Booking document at a time, then navigate away."""
+
+        maximum = max(1, int(max_hotels))
+        options.stats.setdefault("pagination_offsets_visited", [])
+        options.stats.setdefault("pagination_page_card_counts", [])
+        options.stats.setdefault("pagination_page_unique_additions", [])
+        options.stats.setdefault("pagination_pages_extracted", 0)
+        options.stats["pagination_dom_replaced"] = True
+        options.stats.setdefault("extraction_time_seconds", 0.0)
+        options.stats.setdefault("filtered_out_records", 0)
+        try:
+            maximum_offset = max(
+                NORMAL_PAGE_SIZE,
+                int(os.getenv("OTA_BOOKING_MAX_OFFSET", "5000")),
+            )
+        except ValueError:
+            maximum_offset = 5000
+        retained = PaginationResults(self._load_resumable_partial(checkin_date, options, log_callback))
+        offset = (
+            next_resume_offset(retained.successful_count())
+            if options.resume_partial_results
+            else 0
+        )
+        options.stats["pagination_resumed_unique_records"] = len(retained)
+        options.stats["pagination_start_offset"] = offset
+        count_details = self._extract_booking_visible_result_count_details(
+            page,
+            log_callback,
+            expected_city=city_or_region,
+        )
+        options.stats["booking_visible_result_count"] = count_details.get("count")
+        options.stats["visible_result_count_text"] = count_details.get("text")
+        options.stats["visible_result_count_is_lower_bound"] = bool(
+            count_details.get("is_lower_bound")
+        )
+        options.stats["target_result_count"] = None
+        filtered_total = 0
+        retained_keys = {
+            key
+            for key in (hotel_identity(row) for row in retained.values())
+            if key
+        }
+        previous_page_keys: list[str] | None = None
+
+        while True:
+            if self.should_stop(options):
+                options.stats["completion_status"] = "incomplete_user_stopped"
+                options.stats["pagination_stop_reason"] = "user_stop"
+                raise RuntimeError("stopped_by_user: cancelled during Booking pagination")
+            if offset > maximum_offset:
+                options.stats["completion_status"] = "incomplete_max_offset_guard"
+                options.stats["pagination_stop_reason"] = "maximum_offset_guard"
+                raise RuntimeError(
+                    f"Booking pagination exceeded conservative offset guard {maximum_offset}"
+                )
+
+            requested_url = url_with_offset(base_url, offset)
+            if offset or urlparse(page.url).query != urlparse(requested_url).query:
+                self.log(log_callback, f"Navigating to bounded Booking results offset={offset}: {requested_url}")
+                page.goto(
+                    requested_url,
+                    wait_until="domcontentloaded",
+                    timeout=45000,
+                )
+                page.wait_for_timeout(1200 if options.fast_mode else 2000)
+                self._wait_for_any_card_selector(page, log_callback)
+                final_query = dict(parse_qsl(urlparse(page.url).query))
+                if offset and int(final_query.get("offset") or -1) != offset:
+                    options.stats["completion_status"] = "incomplete_offset_not_honored"
+                    options.stats["pagination_stop_reason"] = "offset_not_honored"
+                    raise RuntimeError(
+                        f"Booking offset pagination was not honored: requested {offset}, final URL {page.url}"
+                    )
+                if final_query.get("order") != "price":
+                    raise RuntimeError(
+                        f"Booking price sort was not preserved at offset {offset}: {page.url}"
+                    )
+                self._verify_search_results_or_raise(
+                    page,
+                    city_or_region,
+                    checkin_date,
+                    checkout_date,
+                    adults,
+                    log_callback,
+                )
+                self._ensure_currency(page, currency, options, log_callback)
+
+            page_card_count = self._valid_card_count(page, selector)
+            options.stats["pagination_offsets_visited"].append(offset)
+            options.stats["pagination_page_card_counts"].append(page_card_count)
+            options.stats["pagination_max_offset"] = offset
+            self.log(
+                log_callback,
+                f"Booking pagination page offset={offset}: {page_card_count} valid DOM cards before extraction.",
+            )
+            if page_card_count == 0:
+                options.stats["completion_status"] = "completed_results_exhausted"
+                options.stats["pagination_stop_reason"] = "empty_page"
+                break
+
+            extraction_started = time.perf_counter()
+            page_rows = self._bulk_extract_cards(
+                page,
+                selector,
+                page_card_count,
+                city_or_region,
+                base_url,
+                checkin_date,
+                checkout_date,
+                number_of_nights,
+                adults,
+                currency,
+                screenshot_path,
+                log_callback,
+                options,
+                ranking_offset=offset,
+            )
+            raw_extracted_count = len(page_rows)
+            if not options.disable_filters_during_complete_collection:
+                before_filter = len(page_rows)
+                page_rows = self._filter_hotels_only(page_rows, options, log_callback)
+                page_rows = self._filter_by_star_rating(page_rows, options, log_callback)
+                filtered_total += before_filter - len(page_rows)
+            page_keys = [
+                key for key in (hotel_identity(row) for row in page_rows) if key
+            ]
+            if (
+                offset > 0
+                and page_keys
+                and (
+                    (previous_page_keys and page_keys == previous_page_keys)
+                    or (
+                        options.resume_partial_results
+                        and all(key in retained_keys for key in page_keys)
+                    )
+                )
+            ):
+                options.stats["completion_status"] = (
+                    "incomplete_pagination_unsupported"
+                )
+                options.stats["pagination_stop_reason"] = (
+                    "offset_returned_identical_page"
+                )
+                raise PaginationUnsupportedError(
+                    "Booking kept offset in the URL but returned the identical "
+                    f"{len(page_keys)} hotel cards at offset {offset}; bounded "
+                    "offset pagination is not supported by this interface."
+                )
+            added = retained.add(page_rows)
+            retained_keys.update(page_keys)
+            options.stats["pagination_page_unique_additions"].append(added)
+            options.stats["pagination_pages_extracted"] = len(
+                options.stats["pagination_offsets_visited"]
+            )
+            options.stats["unique_hotels_collected"] = retained.successful_count()
+            options.stats["filtered_out_records"] = filtered_total
+            options.stats["extraction_time_seconds"] = round(
+                float(options.stats.get("extraction_time_seconds", 0))
+                + time.perf_counter()
+                - extraction_started,
+                2,
+            )
+            if options.partial_results_callback:
+                options.partial_results_callback(
+                    checkin_date,
+                    retained.values(),
+                    {
+                        "pagination_offset": offset,
+                        "pagination_page_card_count": page_card_count,
+                        "pagination_pages_extracted": options.stats[
+                            "pagination_pages_extracted"
+                        ],
+                        "unique_hotels_collected": retained.successful_count(),
+                        "new_hotels_added_last_page": added,
+                    },
+                )
+            self.log(
+                log_callback,
+                f"Booking pagination extracted offset={offset} before navigation: "
+                f"raw={raw_extracted_count}, new_unique={added}, retained={retained.successful_count()}.",
+            )
+            self.progress(
+                progress_callback,
+                min(0.88, 0.45 + retained.successful_count() / maximum * 0.4),
+                f"Booking page offset {offset}: {retained.successful_count()} unique hotels saved",
+            )
+
+            level, reason = self._pagination_resource_check(options)
+            if level == "warning":
+                self.log(log_callback, f"Pagination resource warning: {reason}")
+            elif level in {"soft", "hard"}:
+                options.stats["completion_status"] = (
+                    "incomplete_resource_soft_limit"
+                    if level == "soft"
+                    else "incomplete_resource_hard_limit"
+                )
+                options.stats["pagination_stop_reason"] = f"resource_{level}"
+                raise ResourcePressureError(
+                    f"Booking pagination resource {level} stop after offset {offset}: {reason}",
+                    level=level,
+                )
+
+            if retained.successful_count() >= maximum:
+                options.stats["completion_status"] = "completed_target_reached"
+                options.stats["pagination_stop_reason"] = "target_reached"
+                break
+            if added == 0:
+                options.stats["completion_status"] = "completed_results_exhausted"
+                options.stats["pagination_stop_reason"] = "no_new_unique_hotels"
+                break
+            if page_card_count < NORMAL_PAGE_SIZE:
+                options.stats["completion_status"] = "completed_results_exhausted"
+                options.stats["pagination_stop_reason"] = "short_final_page"
+                break
+            if self._detect_end_of_results_text(self._bottom_visible_text(page)):
+                options.stats["completion_status"] = "completed_results_exhausted"
+                options.stats["pagination_stop_reason"] = "end_of_results_signal"
+                break
+            previous_page_keys = page_keys
+            offset += NORMAL_PAGE_SIZE
+
+        values = retained.values()
+        limited: list[dict[str, Any]] = []
+        successes = 0
+        for row in values:
+            is_success = bool(row.get("hotel_name")) and str(
+                row.get("collection_status") or "success"
+            ) == "success"
+            if is_success:
+                if successes >= maximum:
+                    continue
+                successes += 1
+            limited.append(row)
+        options.stats["results_exhausted"] = (
+            options.stats.get("completion_status") == "completed_results_exhausted"
+        )
+        options.stats["final_stop_reason"] = options.stats["completion_status"]
+        options.stats["actual_parse_failures"] = sum(
+            1
+            for row in limited
+            if str(row.get("collection_status") or "success") != "success"
+        )
+        return limited
+
+    def _load_resumable_partial(
+        self,
+        stay_date: date,
+        options: CollectorOptions,
+        log_callback: LogCallback | None,
+    ) -> list[dict[str, object]]:
+        if not options.resume_partial_results or not options.partial_dir:
+            return []
+        path = Path(options.partial_dir) / f"{stay_date.isoformat()}_partial_hotels.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return []
+        if not isinstance(payload, list):
+            return []
+        rows = [dict(row) for row in payload if isinstance(row, dict)]
+        self.log(log_callback, f"Loaded {len(rows)} resumable partial Booking records from {path}.")
+        return rows
+
+    def _pagination_resource_check(
+        self,
+        options: CollectorOptions,
+    ) -> tuple[str, str]:
+        if options.resource_check_callback:
+            level, payload = options.resource_check_callback()
+            payload = dict(payload or {})
+            reason = str(payload.pop("reason", level))
+        else:
+            snapshot = pagination_resource_snapshot()
+            level, reason = evaluate_pagination_resources(snapshot)
+            payload = snapshot.as_dict()
+        options.stats.update(payload)
+        options.stats["resource_guard_level"] = level
+        options.stats["peak_browser_rss_mb"] = max(
+            float(options.stats.get("peak_browser_rss_mb") or 0),
+            float(payload.get("browser_rss_mb") or 0),
+        )
+        options.stats["peak_browser_pss_mb"] = max(
+            float(options.stats.get("peak_browser_pss_mb") or 0),
+            float(payload.get("browser_pss_mb") or 0),
+        )
+        available = payload.get("available_ram_mb")
+        if available is not None:
+            previous = options.stats.get("minimum_available_ram_mb")
+            options.stats["minimum_available_ram_mb"] = (
+                float(available)
+                if previous is None
+                else min(float(previous), float(available))
+            )
+        self._notify_status(options, f"pagination resource check: {level}", **payload)
+        return level, reason
+
     def _progressive_scroll(
         self,
         page,
@@ -1814,23 +2105,85 @@ class BookingPlaywrightCollector(BaseCollector):
                 pass
         return clean_hotel_name(hotel_name)
 
-    def _extract_booking_visible_result_count_details(self, page, log_callback: LogCallback | None = None) -> dict[str, object]:
+    def _extract_booking_visible_result_count_details(
+        self,
+        page,
+        log_callback: LogCallback | None = None,
+        *,
+        expected_city: str | None = None,
+    ) -> dict[str, object]:
+        """Read only Booking's result heading; never infer totals from page text.
+
+        Booking pages contain dates, tracking identifiers and accessibility labels
+        with large numbers.  Treating the entire body as a result counter produced
+        impossible totals such as 25,309.  Pagination does not depend on this
+        optional estimate, so an unverified or implausible value is simply ignored.
+        """
+
         try:
-            text = self._safe_body_text(page)
-        except PlaywrightError:
-            return {"count": None, "text": None, "is_lower_bound": False}
-        compact_text = re.sub(r"\s+", " ", text)
-        patterns = [
-            r"\b(?P<count>\d[\d\s,.]*)(?P<plus>\+)?\s*(?:hotels|properties|results|\u00e9tablissements|etablissements)\s*(?:found|trouv\u00e9s|trouves)\b",
-            r"\b(?P<prefix>plus de|over|more than)\s+(?P<count>\d[\d\s,.]*)(?P<plus>\+)?\s*(?:hotels|properties|results|\u00e9tablissements|etablissements)\b",
-            r"\b(?:showing|found|environ|about|approximately)\s+(?P<count>\d[\d\s,.]*)(?P<plus>\+)?\s*(?:hotels|properties|results|\u00e9tablissements|etablissements)\b",
-        ]
-        for pattern in patterns:
-            for match in re.finditer(pattern, compact_text, re.I):
+            maximum_plausible = max(
+                NORMAL_PAGE_SIZE,
+                int(os.getenv("OTA_BOOKING_MAX_VERIFIED_RESULT_COUNT", "10000")),
+            )
+        except ValueError:
+            maximum_plausible = 10000
+        selectors = (
+            "[data-testid='header-title']",
+            "h1[data-testid='header-title']",
+            "main h1",
+        )
+        heading_texts: list[str] = []
+        for selector in selectors:
+            try:
+                locator = page.locator(selector)
+                for index in range(min(locator.count(), 3)):
+                    text = re.sub(
+                        r"\s+",
+                        " ",
+                        locator.nth(index).inner_text(timeout=1200),
+                    ).strip()
+                    if text and text not in heading_texts:
+                        heading_texts.append(text)
+            except PlaywrightError:
+                continue
+
+        city_token = (clean_hotel_name(expected_city) or "").casefold()
+        patterns = (
+            r"^(?:(?P<city>.+?)\s*:\s*)?(?P<prefix>over|more than|plus de)?\s*"
+            r"(?P<count>\d[\d\s,.]*)(?P<plus>\+)?\s*"
+            r"(?:properties|property|hotels|results|\u00e9tablissements|etablissements)"
+            r"\s*(?:found|available|trouv\u00e9s|trouves)?$",
+        )
+        for heading in heading_texts:
+            for pattern in patterns:
+                match = re.fullmatch(pattern, heading, re.I)
+                if not match:
+                    continue
                 parsed = self._parse_result_count_match(match)
-                if parsed:
-                    self.log(log_callback, f"Booking.com visible result count detected: {parsed['text']}")
-                    return parsed
+                if not parsed:
+                    continue
+                count = int(parsed["count"])
+                matched_city = (
+                    clean_hotel_name(match.groupdict().get("city")) or ""
+                ).casefold()
+                if city_token and matched_city and city_token not in matched_city:
+                    self.log(
+                        log_callback,
+                        f"Ignoring result heading for another destination: {heading!r}",
+                    )
+                    continue
+                if count > maximum_plausible:
+                    self.log(
+                        log_callback,
+                        f"Ignoring implausible Booking result heading count {count}: {heading!r}",
+                    )
+                    continue
+                parsed["text"] = heading
+                self.log(
+                    log_callback,
+                    f"Verified Booking.com result heading: {heading!r}; count={count}.",
+                )
+                return parsed
         return {"count": None, "text": None, "is_lower_bound": False}
 
     def _parse_result_count_match(self, match) -> dict[str, object] | None:
@@ -2559,6 +2912,8 @@ class BookingPlaywrightCollector(BaseCollector):
         screenshot_path: Path | None,
         log_callback: LogCallback | None,
         options: CollectorOptions,
+        *,
+        ranking_offset: int = 0,
     ) -> list[dict]:
         raw_rows = page.locator(selector).evaluate_all(
             r"""
@@ -2664,7 +3019,7 @@ class BookingPlaywrightCollector(BaseCollector):
 
         results: list[dict] = []
         seen: dict[str, dict] = {}
-        for index, raw in enumerate(raw_rows, start=1):
+        for index, raw in enumerate(raw_rows, start=ranking_offset + 1):
             raw_name = raw.get("raw_hotel_name")
             name = clean_hotel_name(raw_name)
             key = raw.get("hotel_url") or name

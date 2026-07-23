@@ -14,10 +14,18 @@ from typing import Any
 DATE_TERMINAL_STATUSES = {
     "completed",
     "completed_partial",
+    "completed_target_reached",
+    "completed_results_exhausted",
     "failed_after_retries",
     "blocked_or_access_restricted",
     "skipped_resume",
+    "stopped_resource_limit",
     "stopped_by_user",
+}
+
+DATE_PROVEN_COMPLETE_STATUSES = {
+    "completed_target_reached",
+    "completed_results_exhausted",
 }
 
 
@@ -191,10 +199,14 @@ def update_checkpoint_date(
     checkpoint["in_progress_date"] = date_key if status == "running" else None
     checkpoint["last_error"] = error
     checkpoint["last_updated_at"] = now
-    if status == "completed":
+    if status in DATE_PROVEN_COMPLETE_STATUSES or status == "skipped_resume":
         _append_unique(checkpoint.setdefault("completed_dates", []), date_key)
         checkpoint["last_successful_date"] = date_key
-    elif status == "failed_after_retries":
+    else:
+        completed_dates = checkpoint.setdefault("completed_dates", [])
+        if date_key in completed_dates:
+            completed_dates.remove(date_key)
+    if status == "failed_after_retries":
         _append_unique(checkpoint.setdefault("failed_dates", []), date_key)
     elif status == "blocked_or_access_restricted":
         _append_unique(checkpoint.setdefault("blocked_dates", []), date_key)
@@ -243,6 +255,26 @@ def heartbeat_is_stale(path: Path, stale_after_seconds: int = 90) -> bool:
     return (datetime.now() - updated).total_seconds() > stale_after_seconds
 
 
+def proven_completed_dates(
+    checkpoint: dict[str, Any],
+    database_date_counts: dict[str, int],
+) -> set[str]:
+    """Return only dates whose checkpoint proves a durable terminal result."""
+
+    date_statuses = checkpoint.get("date_statuses") or {}
+    completed: set[str] = set()
+    for date_key, row in date_statuses.items():
+        if not isinstance(row, dict):
+            continue
+        status = row.get("status")
+        count = int(database_date_counts.get(str(date_key), 0) or 0)
+        if status == "completed_results_exhausted":
+            completed.add(str(date_key))
+        elif status in {"completed_target_reached", "skipped_resume"} and count > 0:
+            completed.add(str(date_key))
+    return completed
+
+
 def should_export_snapshot(completed_count: int, last_snapshot_time: float, frequency: str) -> bool:
     if frequency == "every_date":
         return False
@@ -263,6 +295,12 @@ def final_run_status(date_rows: list[dict[str, Any]], stopped: bool, fatal_error
         return "completed_with_blocked_dates"
     if "failed_after_retries" in statuses:
         return "completed_with_failed_dates"
-    if statuses and statuses <= {"completed", "skipped_resume"}:
+    if "stopped_resource_limit" in statuses:
+        return "stopped_resource_limit"
+    if statuses and statuses <= {
+        "completed_target_reached",
+        "completed_results_exhausted",
+        "skipped_resume",
+    }:
         return "completed_all_dates"
     return "completed_with_failed_dates"
