@@ -162,11 +162,50 @@ def count_results_by_run_id(run_id: int, backend: str | None = None) -> int:
         return int(conn.execute("select count(*) from hotel_price_results where collection_run_id = ?", (run_id,)).fetchone()[0])
 
 
+def _empty_result_aggregates() -> dict[str, Any]:
+    return {
+        "total_observations": 0,
+        "unique_hotels": 0,
+        "completed_dates_with_rows": 0,
+        "completed_date_count": 0,
+        "rows_with_raw_price": 0,
+        "rows_with_parsed_price": 0,
+        "rows_missing_price": 0,
+        "successful_records": 0,
+        "failed_records": 0,
+        "minimum_price": None,
+        "maximum_price": None,
+        "average_price": None,
+    }
+
+
+def _normalized_result_aggregates(row: Any) -> dict[str, Any]:
+    values = _empty_result_aggregates()
+    if row is not None:
+        values.update(dict(row))
+    for field in (
+        "total_observations",
+        "unique_hotels",
+        "completed_dates_with_rows",
+        "rows_with_raw_price",
+        "rows_with_parsed_price",
+        "rows_missing_price",
+        "successful_records",
+        "failed_records",
+    ):
+        values[field] = int(values.get(field) or 0)
+    values["completed_date_count"] = values["completed_dates_with_rows"]
+    return values
+
+
 def result_aggregates_by_run_id(
-    run_id: int,
+    run_id: int | None,
     backend: str | None = None,
 ) -> dict[str, Any]:
-    """Return authoritative full-run metrics without loading the UI preview."""
+    """Return authoritative full-run metrics without loading or mutating rows."""
+
+    if run_id is None:
+        return _empty_result_aggregates()
 
     identity_sql = (
         "nullif(lower(coalesce(nullif(hotel_url, ''), "
@@ -184,7 +223,8 @@ def result_aggregates_by_run_id(
             sum(case when collection_status = 'success' then 1 else 0 end) as successful_records,
             sum(case when collection_status <> 'success' then 1 else 0 end) as failed_records,
             min({price_sql}) as minimum_price,
-            max({price_sql}) as maximum_price
+            max({price_sql}) as maximum_price,
+            avg({price_sql}) as average_price
         from hotel_price_results
         where collection_run_id = {{placeholder}}
     """
@@ -194,10 +234,18 @@ def result_aggregates_by_run_id(
                 cur.execute(query.format(placeholder="%s"), (run_id,))
                 row = cur.fetchone()
                 columns = [description.name for description in cur.description]
-                return dict(zip(columns, row))
-    with _sqlite_connection() as conn:
+                return _normalized_result_aggregates(
+                    dict(zip(columns, row)) if row is not None else None
+                )
+    if not SQLITE_DB_PATH.exists():
+        return _empty_result_aggregates()
+    uri = SQLITE_DB_PATH.resolve().as_uri() + "?mode=ro"
+    with sqlite3.connect(uri, uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("pragma query_only=ON")
+        conn.execute("pragma busy_timeout=30000")
         row = conn.execute(query.format(placeholder="?"), (run_id,)).fetchone()
-        return dict(row) if row is not None else {}
+        return _normalized_result_aggregates(row)
 
 
 def result_date_counts_by_run_id(run_id: int, backend: str | None = None) -> dict[str, int]:

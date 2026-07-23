@@ -2337,6 +2337,7 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
         )
         summary["lowest price"] = aggregates.get("minimum_price")
         summary["highest price"] = aggregates.get("maximum_price")
+        summary["average price"] = aggregates.get("average_price")
         summary["results retained in worker memory"] = len(normalized_results)
         summary["preview rows shown"] = len(normalized_results)
         summary["__date_status_rows"] = date_status_rows
