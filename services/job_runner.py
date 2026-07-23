@@ -221,6 +221,16 @@ def update_checkpoint_date(
     checkpoint["last_updated_at"] = now
     if status in COMPLETED_DATE_STATUSES - {"skipped_resume"}:
         _append_unique(checkpoint.setdefault("completed_dates", []), date_key)
+        checkpoint["failed_dates"] = [
+            value
+            for value in checkpoint.setdefault("failed_dates", [])
+            if str(value) != date_key
+        ]
+        checkpoint["blocked_dates"] = [
+            value
+            for value in checkpoint.setdefault("blocked_dates", [])
+            if str(value) != date_key
+        ]
         checkpoint["last_successful_date"] = date_key
     elif status == "skipped_resume":
         _append_unique(checkpoint.setdefault("completed_dates", []), date_key)

@@ -79,6 +79,7 @@ from services.job_runner import (
 )
 from services.normalizer import normalize_hotel_result
 from services.playwright_safe import launch_managed_chromium_context, safe_close_browser, safe_screenshot
+from services.partial_recovery import recover_checkpoint_status_failures
 from services.resource_guard import (
     ResourceGuard,
     ResourceLimitExceeded,
@@ -86,6 +87,7 @@ from services.resource_guard import (
     SingleScraperLock,
     cleanup_owned_browser_processes,
 )
+from services.status_reporting import build_status_fields
 from services.scraper_errors import (
     AccessRestrictionError,
     BrowserClosedError,
@@ -870,11 +872,20 @@ def build_diagnostic_summary() -> str:
     return "\n".join(lines)
 
 
-def update_status_file(**updates: Any) -> None:
-    payload = read_current_status_file()
-    payload.update(updates)
-    payload["last_updated_at"] = datetime.now().isoformat(sep=" ", timespec="seconds")
-    write_json_file(STATUS_FILE, payload)
+def update_status_file(**updates: Any) -> bool:
+    try:
+        payload = read_current_status_file()
+        payload.update(updates)
+        payload["last_updated_at"] = datetime.now().isoformat(sep=" ", timespec="seconds")
+        write_json_file(STATUS_FILE, payload)
+        return True
+    except Exception as exc:
+        print(
+            f"Warning: nonessential status-file update failed for {STATUS_FILE}: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return False
 
 
 def _preflight_check_playwright_chromium() -> tuple[bool, str]:
@@ -2216,7 +2227,19 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
             snapshot = guard.check()
             telemetry = {**snapshot.as_dict(), "resource_guard_level": guard.last_level}
             options.stats.update(telemetry)
-            update_status_file(**updates, **telemetry)
+            status_fields = build_status_fields(
+                status_updates=updates,
+                resource_metrics=telemetry,
+                authoritative_fields={
+                    "available_ram_mb": snapshot.available_ram_mb,
+                },
+            )
+            if not update_status_file(**status_fields):
+                put_log(
+                    queue,
+                    "Warning: status telemetry could not be written; "
+                    "hotel collection and persistence will continue.",
+                )
             put_metrics(queue, {**(options.stats or {}), **updates, **telemetry})
 
         def partial_results_callback(stay_date: date, records: list[dict[str, Any]], metadata: dict[str, Any]) -> None:
@@ -2388,6 +2411,33 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
             log(f"New run created: {run_id}")
         queue.put(("run_id", run_id))
         queue.put(("records_saved", saved_count))
+        recovered_partials = recover_checkpoint_status_failures(
+            checkpoint,
+            planned_dates=planned_dates,
+            partial_dir=PARTIAL_DIR,
+            run_id=run_id,
+            source=config.source,
+            city_or_region=config.city_or_region,
+            number_of_nights=config.nights,
+            adults=config.adults,
+            currency=config.currency,
+            backend=config.db_backend,
+            dry_run=False,
+            log=log,
+            strict=False,
+        )
+        if recovered_partials:
+            saved_count = count_results_by_run_id(run_id, backend=config.db_backend)
+            normalized_results = fetch_results_by_run_id_limited(
+                run_id,
+                MAX_UI_RESULTS,
+                backend=config.db_backend,
+            )
+            queue.put(("records_saved", saved_count))
+            log(
+                f"Finalized {len(recovered_partials)} date(s) from protected partial "
+                "files after the prior nonessential status-reporting failure."
+            )
         db_date_counts = result_date_counts_by_run_id(run_id, backend=config.db_backend)
         completed_dates = completed_dates_from_checkpoint_and_db(checkpoint, db_date_counts)
         checkpoint["completed_dates"] = sorted(completed_dates)
