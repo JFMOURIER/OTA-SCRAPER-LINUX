@@ -10,10 +10,11 @@ from typing import Any, Callable
 
 import psutil
 
+from services.playwright_safe import find_owned_browser_processes
+
 
 MB = 1024 * 1024
 GB = 1024 * MB
-BROWSER_MARKERS = ("chromium", "chrome", "playwright", "headless_shell")
 
 
 class ResourceLimitExceeded(RuntimeError):
@@ -42,6 +43,7 @@ class ResourceThresholds:
     warn_browser_rss_mb: int = 1800
     stop_browser_rss_mb: int = 2600
     minimum_disk_free_gb: float = 5.0
+    soft_recovery_hysteresis_mb: int = 200
 
     @classmethod
     def from_environment(cls) -> "ResourceThresholds":
@@ -68,6 +70,7 @@ class ResourceThresholds:
             warn_browser_rss_mb=integer("OTA_WARN_BROWSER_RSS_MB", 1800),
             stop_browser_rss_mb=integer("OTA_STOP_BROWSER_RSS_MB", 2600),
             minimum_disk_free_gb=decimal("OTA_MIN_DISK_FREE_GB", 5.0),
+            soft_recovery_hysteresis_mb=integer("OTA_RESOURCE_HYSTERESIS_MB", 200),
         )
 
 
@@ -83,26 +86,14 @@ class ResourceSnapshot:
     browser_rss_mb: float
     browser_process_count: int
     disk_free_gb: float
+    browser_pss_mb: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
 def _browser_descendants(owner_pid: int) -> list[psutil.Process]:
-    try:
-        descendants = psutil.Process(owner_pid).children(recursive=True)
-    except (psutil.Error, OSError):
-        return []
-    matched: list[psutil.Process] = []
-    for process in descendants:
-        try:
-            command = " ".join(process.cmdline()).lower()
-            name = process.name().lower()
-        except (psutil.Error, OSError):
-            continue
-        if any(marker in name or marker in command for marker in BROWSER_MARKERS):
-            matched.append(process)
-    return matched
+    return find_owned_browser_processes(owner_pid)
 
 
 def resource_snapshot(data_path: str | Path, owner_pid: int | None = None) -> ResourceSnapshot:
@@ -115,9 +106,12 @@ def resource_snapshot(data_path: str | Path, owner_pid: int | None = None) -> Re
         python_rss = 0
     browser_processes = _browser_descendants(owner_pid)
     browser_rss = 0
+    browser_pss = 0
     for process in browser_processes:
         try:
             browser_rss += process.memory_info().rss
+            full = process.memory_full_info()
+            browser_pss += int(getattr(full, "pss", 0) or 0)
         except (psutil.Error, OSError):
             continue
     disk = shutil.disk_usage(Path(data_path))
@@ -132,6 +126,7 @@ def resource_snapshot(data_path: str | Path, owner_pid: int | None = None) -> Re
         browser_rss_mb=round(browser_rss / MB, 1),
         browser_process_count=len(browser_processes),
         disk_free_gb=round(disk.free / GB, 2),
+        browser_pss_mb=round(browser_pss / MB, 1),
     )
 
 
@@ -152,19 +147,30 @@ def evaluate_snapshot(
             f"swap is {snapshot.swap_percent:.1f}% used with {snapshot.swap_free_mb:.0f} MB free; "
             f"available RAM is {snapshot.available_ram_mb:.0f} MB"
         )
-        if snapshot.available_ram_mb < thresholds.swap_pressure_available_mb:
+        # Swap occupancy is historical on Linux.  It becomes a hard emergency
+        # only when RAM is also below the start-safety floor.  Between that
+        # floor and the recovery threshold the collector should stop loading,
+        # extract the cards already present, and close Chromium cleanly.
+        if snapshot.available_ram_mb <= max(
+            thresholds.emergency_available_mb,
+            thresholds.minimum_start_available_mb,
+        ):
             return "emergency", swap_reason
+        if snapshot.available_ram_mb < thresholds.swap_pressure_available_mb:
+            return "soft_recovery", swap_reason
         warnings.append(swap_reason)
     if starting and snapshot.available_ram_mb < thresholds.minimum_start_available_mb:
         return "stop", f"available RAM is below the {thresholds.minimum_start_available_mb} MB start threshold"
     if snapshot.python_rss_mb >= thresholds.stop_python_rss_mb:
         return "stop", f"worker RSS is {snapshot.python_rss_mb:.0f} MB"
-    if snapshot.browser_rss_mb >= thresholds.stop_browser_rss_mb:
-        return "stop", f"scraper browser RSS is {snapshot.browser_rss_mb:.0f} MB"
+    effective_browser_mb = snapshot.browser_pss_mb if snapshot.browser_pss_mb > 0 else snapshot.browser_rss_mb
+    memory_label = "PSS" if snapshot.browser_pss_mb > 0 else "summed RSS"
+    if effective_browser_mb >= thresholds.stop_browser_rss_mb:
+        return "soft_recovery", f"scraper browser {memory_label} is {effective_browser_mb:.0f} MB"
     if snapshot.python_rss_mb >= thresholds.warn_python_rss_mb:
         warnings.append(f"worker RSS {snapshot.python_rss_mb:.0f} MB")
-    if snapshot.browser_rss_mb >= thresholds.warn_browser_rss_mb:
-        warnings.append(f"browser RSS {snapshot.browser_rss_mb:.0f} MB")
+    if effective_browser_mb >= thresholds.warn_browser_rss_mb:
+        warnings.append(f"browser {memory_label} {effective_browser_mb:.0f} MB")
     return ("warning", "; ".join(warnings)) if warnings else ("ok", "within configured limits")
 
 
@@ -187,8 +193,10 @@ class ResourceGuard:
         self._last_check = 0.0
         self.peak_python_rss_mb = 0.0
         self.peak_browser_rss_mb = 0.0
+        self.peak_browser_pss_mb = 0.0
         self.peak_browser_process_count = 0
         self.minimum_available_ram_mb = float("inf")
+        self._soft_recovery_active = False
 
     def check(self, *, starting: bool = False, force: bool = False) -> ResourceSnapshot:
         now = time.monotonic()
@@ -196,9 +204,30 @@ class ResourceGuard:
             return self.last_snapshot
         snapshot = resource_snapshot(self.data_path, self.owner_pid)
         level, reason = evaluate_snapshot(snapshot, self.thresholds, starting=starting)
+        if level == "soft_recovery":
+            self._soft_recovery_active = True
+        elif self._soft_recovery_active and level in {"ok", "warning"}:
+            effective_browser_mb = snapshot.browser_pss_mb if snapshot.browser_pss_mb > 0 else snapshot.browser_rss_mb
+            ram_recovered = snapshot.available_ram_mb >= (
+                self.thresholds.swap_pressure_available_mb + self.thresholds.soft_recovery_hysteresis_mb
+            )
+            browser_recovered = effective_browser_mb < max(
+                0,
+                self.thresholds.warn_browser_rss_mb - self.thresholds.soft_recovery_hysteresis_mb,
+            )
+            if not (ram_recovered and browser_recovered):
+                level = "soft_recovery"
+                reason = (
+                    "resource recovery hysteresis active; "
+                    f"available RAM is {snapshot.available_ram_mb:.0f} MB and "
+                    f"browser memory is {effective_browser_mb:.0f} MB"
+                )
+            else:
+                self._soft_recovery_active = False
         self.last_snapshot = snapshot
         self.peak_python_rss_mb = max(self.peak_python_rss_mb, snapshot.python_rss_mb)
         self.peak_browser_rss_mb = max(self.peak_browser_rss_mb, snapshot.browser_rss_mb)
+        self.peak_browser_pss_mb = max(self.peak_browser_pss_mb, snapshot.browser_pss_mb)
         self.peak_browser_process_count = max(self.peak_browser_process_count, snapshot.browser_process_count)
         self.minimum_available_ram_mb = min(self.minimum_available_ram_mb, snapshot.available_ram_mb)
         self.last_level = level
@@ -212,6 +241,7 @@ class ResourceGuard:
         return {
             "peak_python_rss_mb": round(self.peak_python_rss_mb, 1),
             "peak_browser_rss_mb": round(self.peak_browser_rss_mb, 1),
+            "peak_browser_pss_mb": round(self.peak_browser_pss_mb, 1),
             "peak_browser_process_count": self.peak_browser_process_count,
             "minimum_available_ram_mb": None if self.minimum_available_ram_mb == float("inf") else round(self.minimum_available_ram_mb, 1),
         }
@@ -262,8 +292,10 @@ def cleanup_owned_browser_processes(
     log: Callable[[str], None] | None = None,
     *,
     terminate_timeout_seconds: float = 3.0,
+    profile_dir: str | Path | None = None,
+    job_token: str | None = None,
 ) -> dict[str, Any]:
-    processes = _browser_descendants(owner_pid)
+    processes = find_owned_browser_processes(owner_pid, profile_dir=profile_dir, job_token=job_token)
     targeted = [process.pid for process in processes]
     if log:
         log(f"Browser cleanup: {len(processes)} scraper-owned descendant(s) found: {targeted}")

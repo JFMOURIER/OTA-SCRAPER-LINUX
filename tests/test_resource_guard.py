@@ -51,7 +51,21 @@ class ResourceGuardTests(unittest.TestCase):
 
     def test_browser_rss_stop(self):
         level, _ = evaluate_snapshot(snapshot(browser_rss_mb=2700), self.thresholds)
-        self.assertEqual(level, "stop")
+        self.assertEqual(level, "soft_recovery")
+
+    def test_browser_pss_avoids_summed_rss_double_count(self):
+        level, _ = evaluate_snapshot(
+            snapshot(browser_rss_mb=3000, browser_pss_mb=1700),
+            self.thresholds,
+        )
+        self.assertEqual(level, "ok")
+
+    def test_swap_pressure_between_hard_floor_and_recovery_is_soft(self):
+        level, _ = evaluate_snapshot(
+            snapshot(available_ram_mb=922, swap_free_mb=208, swap_percent=94.9),
+            self.thresholds,
+        )
+        self.assertEqual(level, "soft_recovery")
 
     def test_python_rss_stop(self):
         level, _ = evaluate_snapshot(snapshot(python_rss_mb=2500), self.thresholds)

@@ -1,6 +1,8 @@
 [Unit]
 Description=OTA scraper worker instance %i
 After=network-online.target
+StartLimitIntervalSec=3600
+StartLimitBurst=5
 [Service]
 User=jf
 Group=jf
@@ -11,8 +13,6 @@ Environment=DB_BACKEND=sqlite
 ExecStart=/usr/bin/systemd-inhibit --what=sleep:idle --who=OTA-SCRAPER --why=Long-running-OTA-scrape --mode=block /home/jf/Projects/OTA-SCRAPER-LINUX/.venv/bin/python tools/ota_worker_supervisor.py
 Restart=on-failure
 RestartSec=10
-StartLimitIntervalSec=3600
-StartLimitBurst=5
 KillMode=control-group
 TimeoutStopSec=45
 MemoryAccounting=yes

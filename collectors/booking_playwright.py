@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import traceback
@@ -15,6 +16,13 @@ from playwright.sync_api import sync_playwright
 
 from collectors.base import BaseCollector, CollectorOptions, LogCallback, ProgressCallback
 from services.date_utils import calculate_checkout_date, format_timestamp_for_filename
+from services.endurance import (
+    IncrementalResultBuffer,
+    bounded_dom_settings,
+    cleanup_ephemeral_profile,
+    prepare_ephemeral_profile,
+    profile_directory_size_mb,
+)
 from services.normalizer import clean_hotel_name, is_probable_hotel, parse_price_to_decimal, parse_star_rating, property_type_guess
 from services.playwright_safe import (
     interruptible_page_wait,
@@ -23,6 +31,7 @@ from services.playwright_safe import (
     safe_page_title,
     safe_page_url,
     safe_screenshot,
+    wait_for_owned_browser_exit,
 )
 from services.scraper_errors import AccessRestrictionError, BrowserClosedError, is_browser_closed_error
 
@@ -286,6 +295,23 @@ class BookingPlaywrightCollector(BaseCollector):
         self.log(log_callback, f"Browser mode selected: {browser_mode_label}")
         self.log(log_callback, f"Launching Chromium with headless={options.headless}")
         results: list[dict] = []
+        # This buffer is strictly date-scoped because a fresh collector is
+        # created for every date and retry.  It contains only normalized card
+        # dictionaries, never Locators, ElementHandles, HTML, or page objects.
+        self._incremental_results = IncrementalResultBuffer(
+            max_hotels if not collect_all_available_hotels else int(os.getenv("OTA_MAX_RESULTS_PER_DATE", "5000"))
+        )
+        self._incremental_processed_dom = 0
+        self._incremental_rank_offset = 0
+        self._incremental_context = {
+            "city_or_region": city_or_region,
+            "search_url": search_url,
+            "checkin_date": checkin_date,
+            "checkout_date": checkout_date,
+            "number_of_nights": number_of_nights,
+            "adults": adults,
+            "currency": currency,
+        }
         screenshot_paths: list[Path] = []
         error_message: str | None = None
         results_url: str | None = None
@@ -418,6 +444,8 @@ class BookingPlaywrightCollector(BaseCollector):
             page = None
             try:
                 if options.browser_profile_dir:
+                    if options.stats.get("ephemeral_browser_profile"):
+                        prepare_ephemeral_profile(options.browser_profile_dir)
                     self.log(log_callback, f"Using isolated Playwright profile: {options.browser_profile_dir.resolve()}")
                 browser, context, implementation = launch_managed_chromium_context(
                     playwright,
@@ -575,58 +603,20 @@ class BookingPlaywrightCollector(BaseCollector):
                 self._screenshot(page, screenshot_dir, "booking_final_scroll", options, screenshot_paths, log_callback)
                 step(0.55, "final Load more cycle complete", visible_card_count=final_count, current_hotel_card_count=final_count, load_more_clicks=options.stats.get("load_more_clicks", 0))
 
+                self._capture_incremental_cards(page, selector, options, log_callback, screenshot_paths[-1] if screenshot_paths else None)
                 cards = self._valid_cards(page, selector)
-                if not options.collect_all_available:
-                    cards = cards[: int(max_hotels)]
                 self._write_card_debug(cards[:10], debug_dir, options, log_callback)
                 self.log(log_callback, "No property page clicks allowed during scraping.")
 
-                self.log(log_callback, f"Hotel records extracted before filtering: starting extraction from {len(cards)} cards.")
-                step(0.60, "extracting hotels", visible_card_count=len(cards))
+                self.log(
+                    log_callback,
+                    "Hotel records extracted incrementally before filtering: "
+                    f"{len(self._incremental_results)} unique records retained; {len(cards)} live DOM cards remain.",
+                )
+                step(0.60, "finalizing incrementally extracted hotels", visible_card_count=len(cards))
                 extraction_start = time.perf_counter()
-                try:
-                    results = self._bulk_extract_cards(
-                        page,
-                        selector,
-                        len(cards),
-                        city_or_region,
-                        search_url,
-                        checkin_date,
-                        checkout_date,
-                        number_of_nights,
-                        adults,
-                        currency,
-                        screenshot_paths[-1] if screenshot_paths else None,
-                        log_callback,
-                        options,
-                    )
-                    self.progress(progress_callback, 0.90, f"Processed {len(results)} Booking.com cards")
-                except Exception as exc:
-                    self.log(log_callback, f"Bulk card extraction failed, falling back to per-card extraction: {exc}")
-                    for index, card in enumerate(cards, start=1):
-                        self._ensure_results_page(page, results_url, options, log_callback)
-                        if self.should_stop(options):
-                            self.log(log_callback, "Stop requested while extracting Booking.com cards.")
-                            break
-                        try:
-                            result = self._extract_card(
-                                card,
-                                index,
-                                city_or_region,
-                                search_url,
-                                checkin_date,
-                                checkout_date,
-                                number_of_nights,
-                                adults,
-                                currency,
-                                screenshot_paths[-1] if screenshot_paths else None,
-                                log_callback,
-                            )
-                            results.append(result)
-                        except Exception as card_exc:
-                            self.log(log_callback, f"Card {index}: extraction failed: {card_exc}")
-                            results.append(self._failed_result(card_exc, city_or_region, search_url, checkin_date, checkout_date, number_of_nights, adults, currency, index, screenshot_paths[-1] if screenshot_paths else None))
-                        self.progress(progress_callback, 0.55 + (index / max(len(cards), 1)) * 0.35, f"Processed Booking.com card {index} of {len(cards)}")
+                results = self._incremental_results.values()
+                self.progress(progress_callback, 0.90, f"Finalized {len(results)} incrementally extracted Booking.com cards")
                 options.stats["extraction_time_seconds"] = round(float(options.stats.get("extraction_time_seconds", 0)) + (time.perf_counter() - extraction_start), 2)
                 options.stats["unique_hotels_collected"] = len({(row.get("hotel_url") or clean_hotel_name(row.get("hotel_name"))) for row in results if row.get("hotel_name")})
 
@@ -690,6 +680,29 @@ class BookingPlaywrightCollector(BaseCollector):
             finally:
                 self._write_debug_json(page, results_url, screenshot_paths, options, debug_dir, error_message, log_callback)
                 safe_close_browser(browser=browser, context=context, page=page, log=log_callback)
+                cleanup = wait_for_owned_browser_exit(
+                    os.getpid(),
+                    profile_dir=options.browser_profile_dir,
+                    timeout_seconds=3.0,
+                    log=log_callback,
+                )
+                options.stats["browser_process_count_after_close"] = len(cleanup["owned_after_cleanup"])
+                options.stats["browser_cleanup_result"] = cleanup
+                options.stats["profile_directory_size_mb"] = profile_directory_size_mb(options.browser_profile_dir)
+                options.stats["ephemeral_profile_removed"] = False
+                if (
+                    options.stats.get("ephemeral_browser_profile")
+                    and not cleanup["owned_after_cleanup"]
+                ):
+                    options.stats["ephemeral_profile_removed"] = cleanup_ephemeral_profile(
+                        options.browser_profile_dir
+                    )
+                    self.log(
+                        log_callback,
+                        "Ephemeral browser profile cleanup: "
+                        f"removed={options.stats['ephemeral_profile_removed']} "
+                        f"path={options.browser_profile_dir}",
+                    )
                 self.log(log_callback, "Booking.com browser closed.")
 
         step(1.0, "Booking.com collection complete", hotels_collected_current_date=len(results))
@@ -1843,7 +1856,7 @@ class BookingPlaywrightCollector(BaseCollector):
         self.log(log_callback, f"Visible cards found: {len(rows)}")
         self.log(log_callback, f"Unique hotels collected so far: {len(unique_hotels)}")
         self.log(log_callback, f"New unique hotels added this cycle: {added}")
-        if added and options.partial_results_callback:
+        if added and options.partial_results_callback and not options.stats.get("incremental_extraction_enabled"):
             try:
                 current_date_text = str(options.stats.get("current_checkin_date") or "")
                 current_date = date.fromisoformat(current_date_text)
@@ -1870,6 +1883,124 @@ class BookingPlaywrightCollector(BaseCollector):
             except ValueError:
                 pass
         return clean_hotel_name(hotel_name)
+
+    def _capture_incremental_cards(
+        self,
+        page,
+        selector: str,
+        options: CollectorOptions,
+        log_callback: LogCallback | None,
+        screenshot_path: Path | None = None,
+    ) -> int:
+        """Extract only DOM indexes that were not extracted in this live page."""
+
+        if not hasattr(self, "_incremental_results"):
+            return 0
+        live_count = page.locator(selector).count()
+        start_index = min(int(getattr(self, "_incremental_processed_dom", 0)), live_count)
+        if live_count <= start_index:
+            return 0
+        context = dict(getattr(self, "_incremental_context", {}))
+        before = len(self._incremental_results)
+        rows = self._bulk_extract_cards(
+            page,
+            selector,
+            live_count,
+            context["city_or_region"],
+            context["search_url"],
+            context["checkin_date"],
+            context["checkout_date"],
+            context["number_of_nights"],
+            context["adults"],
+            context["currency"],
+            screenshot_path,
+            log_callback,
+            options,
+            start_card=start_index,
+            ranking_offset=int(getattr(self, "_incremental_rank_offset", 0)),
+        )
+        self._incremental_results.add(rows)
+        self._incremental_processed_dom = live_count
+        added = len(self._incremental_results) - before
+        options.stats["incremental_extraction_enabled"] = True
+        options.stats["incremental_batch_cards"] = live_count - start_index
+        options.stats["incremental_unique_records"] = len(self._incremental_results)
+        options.stats["incremental_duplicate_cards"] = self._incremental_results.duplicates_seen
+        if added and options.partial_results_callback:
+            try:
+                options.partial_results_callback(
+                    context["checkin_date"],
+                    self._incremental_results.values(),
+                    {
+                        "visible_hotel_cards_count": live_count,
+                        "unique_hotels_collected": len(self._incremental_results),
+                        "new_hotels_added_last_cycle": added,
+                        "incremental_extraction_enabled": True,
+                    },
+                )
+            except Exception as exc:
+                # The atomic partial write happens before its status callback.
+                # A hard guard exception must still propagate; ordinary status
+                # reporting errors may not discard the extracted batch.
+                from services.resource_guard import ResourceLimitExceeded
+
+                if isinstance(exc, ResourceLimitExceeded):
+                    raise
+                self.log(log_callback, f"Warning: incremental partial status update failed: {exc}")
+        self.log(
+            log_callback,
+            f"Incremental extraction: DOM indexes {start_index}-{live_count - 1}; "
+            f"{added} new, {len(self._incremental_results)} unique retained.",
+        )
+        return added
+
+    def _prune_extracted_dom_cards(
+        self,
+        page,
+        selector: str,
+        options: CollectorOptions,
+        log_callback: LogCallback | None,
+    ) -> int:
+        """Remove only already-extracted old cards, retaining the live tail."""
+
+        enabled, maximum, keep = bounded_dom_settings()
+        if not enabled:
+            return page.locator(selector).count()
+        live_count = page.locator(selector).count()
+        processed = int(getattr(self, "_incremental_processed_dom", 0))
+        removable = min(max(0, live_count - keep), processed)
+        if live_count <= maximum or removable <= 0:
+            options.stats["peak_live_dom_cards"] = max(
+                int(options.stats.get("peak_live_dom_cards", 0)),
+                live_count,
+            )
+            return live_count
+        removed = page.locator(selector).evaluate_all(
+            """
+            (cards, removeCount) => {
+                const targets = cards.slice(0, removeCount);
+                for (const card of targets) card.remove();
+                return targets.length;
+            }
+            """,
+            removable,
+        )
+        removed = int(removed or 0)
+        self._incremental_processed_dom = max(0, processed - removed)
+        self._incremental_rank_offset = int(getattr(self, "_incremental_rank_offset", 0)) + removed
+        remaining = max(0, live_count - removed)
+        options.stats["dom_cards_pruned"] = int(options.stats.get("dom_cards_pruned", 0)) + removed
+        options.stats["live_dom_cards"] = remaining
+        options.stats["peak_live_dom_cards"] = max(
+            int(options.stats.get("peak_live_dom_cards", 0)),
+            live_count,
+        )
+        self.log(
+            log_callback,
+            f"Bounded DOM: removed {removed} extracted cards; {remaining} live cards remain; "
+            f"{len(self._incremental_results)} unique records retained.",
+        )
+        return remaining
 
     def _extract_booking_visible_result_count_details(self, page, log_callback: LogCallback | None = None) -> dict[str, object]:
         try:
@@ -1963,24 +2094,34 @@ class BookingPlaywrightCollector(BaseCollector):
         options.stats["visible_result_count_is_lower_bound"] = bool(count_details.get("is_lower_bound"))
         options.stats["completion_status"] = "loading"
         options.stats["full_loading_started"] = True
+        options.stats["incremental_extraction_enabled"] = True
         self.log(log_callback, "Full Booking.com result loader started.")
 
         current_count = self._best_hotel_card_count(page, selector, log_callback)
+        self._capture_incremental_cards(page, selector, options, log_callback)
         self._update_unique_hotels_from_page(page, selector, unique_results_by_key, options, log_callback)
         last_unique_count = len(unique_results_by_key)
+        current_count = self._prune_extracted_dom_cards(page, selector, options, log_callback)
 
         while True:
-            elapsed = time.monotonic() - start
+            elapsed = time.monotonic() - last_growth
+            hard_elapsed = time.monotonic() - start
             if self.should_stop(options):
                 options.stats["final_stop_reason"] = "stopped_user_requested"
                 options.stats["completion_status"] = "incomplete_user_stopped"
                 self.log(log_callback, "Stop requested during full Booking.com loading.")
                 break
-            if elapsed >= max_seconds:
+            if options.stats.get("resource_guard_level") == "soft_recovery":
+                options.stats["final_stop_reason"] = "completed_resource_safe_limit"
+                options.stats["completion_status"] = "completed_resource_safe_limit"
+                options.stats["stopped_by_resource_limit"] = True
+                self.log(log_callback, "Soft resource pressure detected; finalizing incrementally extracted full results.")
+                break
+            if elapsed >= max_seconds or hard_elapsed >= max_seconds * 4:
                 options.stats["maximum_scroll_time_reached"] = True
-                options.stats["final_stop_reason"] = "stopped_max_scroll_time_reached"
-                options.stats["completion_status"] = "incomplete_max_scroll_time_reached"
-                self.log(log_callback, f"Maximum full collection time reached ({max_scroll_minutes} minutes).")
+                options.stats["final_stop_reason"] = "completed_hard_safety_limit"
+                options.stats["completion_status"] = "completed_hard_safety_limit"
+                self.log(log_callback, f"Full collection inactivity/hard safety limit reached ({max_scroll_minutes} minutes).")
                 break
             if self._detect_access_restriction(page, log_callback):
                 options.stats["final_stop_reason"] = "blocked_or_access_restricted"
@@ -1993,6 +2134,8 @@ class BookingPlaywrightCollector(BaseCollector):
             height_before = self._safe_page_height(page)
 
             before_update_count = len(unique_results_by_key)
+            self._capture_incremental_cards(page, selector, options, log_callback)
+            current_count = self._prune_extracted_dom_cards(page, selector, options, log_callback)
             found = self._scroll_to_bottom_until_load_more(
                 page,
                 selector,
@@ -2020,12 +2163,14 @@ class BookingPlaywrightCollector(BaseCollector):
 
             options.stats["total_scroll_attempts"] = int(options.stats.get("total_scroll_attempts", 0)) + 1
             current_count = self._best_hotel_card_count(page, selector, log_callback)
+            extracted_after_click = self._capture_incremental_cards(page, selector, options, log_callback)
             added_after_click = self._update_unique_hotels_from_page(page, selector, unique_results_by_key, options, log_callback)
             unique_count = len(unique_results_by_key)
             cycle_added = unique_count - before_update_count
-            if unique_count > last_unique_count or added_after_click > 0:
+            if unique_count > last_unique_count or added_after_click > 0 or extracted_after_click > 0:
                 options.stats["consecutive_no_new_unique_results"] = 0
                 last_unique_count = unique_count
+                last_growth = time.monotonic()
             else:
                 options.stats["consecutive_no_new_unique_results"] = int(options.stats.get("consecutive_no_new_unique_results", 0)) + 1
 
@@ -2042,6 +2187,7 @@ class BookingPlaywrightCollector(BaseCollector):
             self.log(log_callback, f"Booking.com result count: {options.stats.get('visible_result_count_text') or target_count or 'unknown'}")
             self.log(log_callback, f"Estimated missing: {estimated_missing if estimated_missing is not None else 'unknown'}")
             self.log(log_callback, f"Page height before/after: {height_before} -> {height_after}; scroll position: {scroll_position}; Load more visible: {'yes' if load_more_visible else 'no'}")
+            current_count = self._prune_extracted_dom_cards(page, selector, options, log_callback)
 
             if target_count and unique_count >= int(target_count):
                 options.stats["completion_status"] = "complete_reached_visible_count"
@@ -2076,15 +2222,13 @@ class BookingPlaywrightCollector(BaseCollector):
             progress_value = min(0.52, 0.12 + (elapsed / max_seconds) * 0.35)
             self.progress(progress_callback, progress_value, f"Loading full Booking.com results: {unique_count} unique loaded")
 
+        self._capture_incremental_cards(page, selector, options, log_callback)
+        self._update_unique_hotels_from_page(page, selector, unique_results_by_key, options, log_callback)
         self._finalize_full_loading_stats(page, unique_results_by_key, options, screenshot_dir, screenshot_paths, log_callback)
-        return self._best_hotel_card_count(page, selector, log_callback)
+        return max(len(unique_results_by_key), len(self._incremental_results))
 
     def _full_loading_no_progress_threshold(self, unique_count: int, target_count: int | None) -> int:
-        if target_count:
-            if unique_count < int(target_count) * 0.9:
-                return 10
-            return 5
-        return 8
+        return 2
 
     def _safe_page_height(self, page) -> int:
         try:
@@ -2353,18 +2497,35 @@ class BookingPlaywrightCollector(BaseCollector):
         last_count = current_count
         scroll_index = 0
         unique_hotels: dict[str, dict] = {}
+        options.stats["incremental_extraction_enabled"] = True
         options.stats["booking_visible_result_count"] = self._extract_booking_visible_result_count(page, log_callback)
+        self._capture_incremental_cards(page, selector, options, log_callback)
         self._update_unique_hotels_from_page(page, selector, unique_hotels, options, log_callback)
-        self.log(log_callback, f"Scroll 0: {current_count} cards found")
+        last_count = max(last_count, len(unique_hotels), len(self._incremental_results))
+        current_count = self._prune_extracted_dom_cards(page, selector, options, log_callback)
+        self.log(
+            log_callback,
+            f"Scroll 0: {last_count} cumulative cards found; {current_count} live DOM cards retained",
+        )
 
         while True:
             if self.should_stop(options):
                 self.log(log_callback, "Stop requested during Booking.com scrolling.")
                 options.stats["final_stop_reason"] = "stopped_user_requested"
                 break
-            if not collect_all_available_hotels and current_count >= int(max_hotels):
+            if not collect_all_available_hotels and len(self._incremental_results) >= int(max_hotels):
                 self.log(log_callback, f"Reached maximum hotels setting ({max_hotels}); stopping scroll.")
                 options.stats["final_stop_reason"] = "completed_max_hotels_reached"
+                break
+            if options.stats.get("resource_guard_level") == "soft_recovery":
+                options.stats["final_stop_reason"] = "completed_resource_safe_limit"
+                options.stats["completion_status"] = "completed_resource_safe_limit"
+                options.stats["stopped_by_resource_limit"] = True
+                self.log(
+                    log_callback,
+                    "Soft resource pressure detected: stopping Load More, preserving all incrementally "
+                    "extracted cards, and closing Chromium after finalization.",
+                )
                 break
             elapsed = time.monotonic() - last_growth
             hard_elapsed = time.monotonic() - start
@@ -2379,7 +2540,9 @@ class BookingPlaywrightCollector(BaseCollector):
                 raise RuntimeError("blocked_or_access_restricted: Booking.com showed CAPTCHA or access restriction wording during scrolling.")
 
             self._ensure_results_page(page, results_url, options, log_callback)
+            captured_before_click = self._capture_incremental_cards(page, selector, options, log_callback)
             cycle_added_before_click = self._update_unique_hotels_from_page(page, selector, unique_hotels, options, log_callback)
+            current_count = self._prune_extracted_dom_cards(page, selector, options, log_callback)
 
             previous_count = current_count
             found = self._scroll_to_bottom_until_load_more(
@@ -2412,11 +2575,18 @@ class BookingPlaywrightCollector(BaseCollector):
             scroll_index += 1
             options.stats["total_scroll_attempts"] = scroll_index
             current_count = self._best_hotel_card_count(page, selector, log_callback)
-            self.log(log_callback, f"Scroll {scroll_index}: {current_count} cards found")
+            self.log(log_callback, f"Scroll {scroll_index}: {current_count} live DOM cards found")
+            captured_after_click = self._capture_incremental_cards(page, selector, options, log_callback)
             cycle_added_after_click = self._update_unique_hotels_from_page(page, selector, unique_hotels, options, log_callback)
-            cycle_added = cycle_added_before_click + cycle_added_after_click
-            if current_count > last_count or cycle_added > 0:
-                last_count = current_count
+            cycle_added = (
+                captured_before_click
+                + captured_after_click
+                + cycle_added_before_click
+                + cycle_added_after_click
+            )
+            cumulative_count = max(len(unique_hotels), len(self._incremental_results), last_count)
+            if current_count > previous_count or cycle_added > 0 or cumulative_count > last_count:
+                last_count = cumulative_count
                 last_growth = time.monotonic()
                 options.stats["consecutive_no_new_card_attempts"] = 0
             else:
@@ -2433,15 +2603,29 @@ class BookingPlaywrightCollector(BaseCollector):
                     break
                 options.stats["consecutive_no_new_card_attempts"] = 0
                 options.stats["consecutive_no_button_attempts"] = 0
+            current_count = self._prune_extracted_dom_cards(page, selector, options, log_callback)
             progress_value = min(0.52, 0.12 + (elapsed / max_seconds) * 0.35)
-            self.progress(progress_callback, progress_value, f"Scrolling Booking.com results: {current_count} cards found")
+            self.progress(
+                progress_callback,
+                progress_value,
+                f"Loading Booking.com results: {last_count} unique extracted; {current_count} live DOM cards",
+            )
 
         if not options.stats.get("final_stop_reason"):
             options.stats["final_stop_reason"] = "completed_no_more_load_more_button"
+        self._capture_incremental_cards(page, selector, options, log_callback)
+        self._update_unique_hotels_from_page(page, selector, unique_hotels, options, log_callback)
+        last_count = max(last_count, len(unique_hotels), len(self._incremental_results))
         options.stats["requested_max_hotels"] = int(max_hotels)
         options.stats["available_cards"] = int(last_count)
         options.stats["results_exhausted"] = options.stats.get("final_stop_reason") in {"completed_no_more_load_more_button", "completed_results_exhausted"}
-        if str(options.stats.get("final_stop_reason", "")).startswith("completed") and options.stats.get("unique_hotels_collected", 0) < int(max_hotels):
+        options.stats["unique_hotels_collected"] = len(self._incremental_results)
+        options.stats["unique_results_loaded"] = len(self._incremental_results)
+        if (
+            str(options.stats.get("final_stop_reason", "")).startswith("completed")
+            and options.stats.get("final_stop_reason") != "completed_resource_safe_limit"
+            and len(self._incremental_results) < int(max_hotels)
+        ):
             options.stats["completion_status"] = "completed_results_exhausted"
             self.log(log_callback, f"Results exhausted: requested up to {max_hotels}, Booking.com exposed {last_count} cards, {options.stats.get('unique_hotels_collected', 0)} valid hotels retained.")
         try:
@@ -2632,10 +2816,13 @@ class BookingPlaywrightCollector(BaseCollector):
         screenshot_path: Path | None,
         log_callback: LogCallback | None,
         options: CollectorOptions,
+        *,
+        start_card: int = 0,
+        ranking_offset: int = 0,
     ) -> list[dict]:
         raw_rows = page.locator(selector).evaluate_all(
             r"""
-            (cards, maxCards) => {
+            (cards, range) => {
                 const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
                 const absoluteUrl = (href) => {
                     if (!href) return null;
@@ -2677,7 +2864,7 @@ class BookingPlaywrightCollector(BaseCollector):
                     return { rating: null, raw: null, aria: null, count: 0, missing: "No star signal found in bulk extraction." };
                 };
                 const rows = [];
-                for (const card of cards.slice(0, maxCards)) {
+                for (const card of cards.slice(range.start, range.end)) {
                     const titleLink = card.querySelector("a[data-testid='title-link'], a[href*='/hotel/']");
                     const titleEl = card.querySelector("[data-testid='title'], a[data-testid='title-link'], h3");
                     const reviewEl = card.querySelector("[data-testid='review-score']");
@@ -2732,12 +2919,13 @@ class BookingPlaywrightCollector(BaseCollector):
                 return rows;
             }
             """,
-            max_cards,
+            {"start": max(0, int(start_card)), "end": max(0, int(max_cards))},
         )
 
         results: list[dict] = []
         seen: dict[str, dict] = {}
-        for index, raw in enumerate(raw_rows, start=1):
+        first_rank = max(0, int(ranking_offset)) + max(0, int(start_card)) + 1
+        for index, raw in enumerate(raw_rows, start=first_rank):
             raw_name = raw.get("raw_hotel_name")
             name = clean_hotel_name(raw_name)
             key = raw.get("hotel_url") or name
@@ -2783,7 +2971,11 @@ class BookingPlaywrightCollector(BaseCollector):
             results.append(row)
             if options.debug_mode and index <= 10:
                 self.log(log_callback, f"Bulk hotel {index}: {name}; star={row['star_rating']}; price={row['cheapest_price_total']}")
-        self.log(log_callback, f"Bulk extracted {len(results)} unique Booking.com hotels from {len(raw_rows)} DOM cards.")
+        self.log(
+            log_callback,
+            f"Bulk extracted {len(results)} unique Booking.com hotels from {len(raw_rows)} new DOM cards "
+            f"(slice {start_card}:{max_cards}).",
+        )
         return results
 
     def _price_from_card_text(self, card_text: str | None) -> str | None:

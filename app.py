@@ -1533,6 +1533,17 @@ def validate_collector_options(config: CollectionConfig, stop_event: Event | Non
         raise FatalScraperConfigError(f"Configuration error:{hint} {message}") from exc
 
 
+def date_attempt_profile_dir(job_token: str, headless: bool, stay_date: date, attempt: int) -> Path:
+    return (
+        BROWSER_PROFILE_DIR
+        / "jobs"
+        / safe_filename(job_token)
+        / ("headless" if headless else "visible")
+        / stay_date.isoformat()
+        / f"attempt_{max(1, int(attempt))}"
+    )
+
+
 def matching_saved_run_id(config: CollectionConfig) -> int | None:
     target_hash = job_signature_hash(config)
     target_checkout = calculate_checkout_date(config.checkin_end, config.nights).isoformat()
@@ -1582,7 +1593,15 @@ def completed_dates_from_checkpoint_and_db(checkpoint: dict[str, Any], counts: d
     for date_key, count in counts.items():
         row = date_statuses.get(date_key)
         if isinstance(row, dict):
-            if row.get("status") in {"completed", "completed_partial", "skipped_resume"} and count > 0:
+            if row.get("status") in {
+                "completed",
+                "completed_partial",
+                "completed_target_reached",
+                "completed_results_exhausted",
+                "completed_resource_safe_limit",
+                "completed_hard_safety_limit",
+                "skipped_resume",
+            } and count > 0:
                 completed.add(date_key)
         elif count > 0:
             completed.add(date_key)
@@ -2133,6 +2152,33 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
         summary.update(price_validation_summary(normalized_results))
         return summary
 
+    def write_endurance_summary(status: str, error: str | None = None) -> Path:
+        path = LOG_DIR / f"endurance_summary_run_{run_id or 'pending'}.json"
+        atomic_write_json(
+            path,
+            {
+                "run_id": run_id,
+                "job_id": getattr(queue, "job_id", None),
+                "instance_id": INSTANCE_CONFIG.instance_id,
+                "status": status,
+                "error": error,
+                "completed_dates": sum(
+                    1
+                    for row in date_status_rows
+                    if str(row.get("status", "")).startswith("completed")
+                    or row.get("status") == "skipped_resume"
+                ),
+                "failed_dates": sum(1 for row in date_status_rows if row.get("status") == "failed_after_retries"),
+                "database_rows": saved_count,
+                "worker_results_retained": len(normalized_results),
+                "resource_peaks": guard.peaks(),
+                "elapsed_seconds": round(time.perf_counter() - perf_start, 2),
+                "date_statuses": date_status_rows,
+                "written_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
+            },
+        )
+        return path
+
     def export_partial(status: str, snapshot: bool = False) -> Path | None:
         if not retry_settings.auto_export_partial_excel:
             return None
@@ -2151,13 +2197,16 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
         log(f"Partial Excel exported: {excel_path}")
         return excel_path
 
-    def make_options(attempt: int) -> CollectorOptions:
+    def make_options(attempt: int, stay_date: date) -> CollectorOptions:
         nonlocal saved_count
         options = CollectorOptions(**collector_options_kwargs(config, stop_event, attempt=attempt))
         partial_seen_keys: set[str] = set()
         job_token = safe_filename(str(getattr(queue, "job_id", None) or f"worker_{os.getpid()}"))
-        mode_token = "headless" if config.headless else "visible"
-        options.browser_profile_dir = BROWSER_PROFILE_DIR / "jobs" / job_token / mode_token
+        # One short-lived profile per date/attempt prevents service workers,
+        # IndexedDB, caches, and GPU state from accumulating for a year-long
+        # run. Historical profiles are preserved; cleanup never deletes them.
+        options.browser_profile_dir = date_attempt_profile_dir(job_token, config.headless, stay_date, attempt)
+        options.stats["ephemeral_browser_profile"] = True
         options.screenshot_dir = SCREENSHOT_DIR / "runs" / job_token
         options.screenshots_dir = options.screenshot_dir
         options.stats["screenshot_limit"] = max(1, int(os.getenv("OTA_SCREENSHOT_LIMIT_PER_DATE", "12")))
@@ -2165,6 +2214,7 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
         def collector_status_callback(updates: dict[str, Any]) -> None:
             snapshot = guard.check()
             telemetry = {**snapshot.as_dict(), "resource_guard_level": guard.last_level}
+            options.stats.update(telemetry)
             update_status_file(**updates, **telemetry)
             put_metrics(queue, {**(options.stats or {}), **updates, **telemetry})
 
@@ -2427,7 +2477,15 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
                     status="running",
                     last_log_message=last_log_message,
                 )
-                options = make_options(attempt)
+                options = make_options(attempt, stay_date)
+                before_launch = guard.check(force=True)
+                log(
+                    "Date browser baseline: "
+                    f"date={date_key} attempt={attempt} browser_rss_mb={before_launch.browser_rss_mb} "
+                    f"browser_pss_mb={before_launch.browser_pss_mb} "
+                    f"browser_processes={before_launch.browser_process_count} "
+                    f"available_ram_mb={before_launch.available_ram_mb} swap_used_mb={before_launch.swap_used_mb}"
+                )
                 try:
                     simulate_date = os.getenv("SIMULATE_BROWSER_CLOSE_ON_DATE")
                     simulate_repeated_date = os.getenv("SIMULATE_REPEATED_FAILURE_DATE")
@@ -2459,7 +2517,19 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
                         checkpoint,
                         stay_date=stay_date,
                         checkout_date=checkout_date,
-                        status=("completed_target_reached" if options.stats.get("final_stop_reason") == "completed_max_hotels_reached" else "completed_results_exhausted" if options.stats.get("completion_status") == "completed_results_exhausted" else "completed" if date_results else "completed_partial"),
+                        status=(
+                            "completed_target_reached"
+                            if options.stats.get("final_stop_reason") == "completed_max_hotels_reached"
+                            else "completed_resource_safe_limit"
+                            if options.stats.get("completion_status") == "completed_resource_safe_limit"
+                            else "completed_hard_safety_limit"
+                            if options.stats.get("completion_status") == "completed_hard_safety_limit"
+                            else "completed_results_exhausted"
+                            if options.stats.get("completion_status") == "completed_results_exhausted"
+                            else "completed"
+                            if date_results
+                            else "completed_partial"
+                        ),
                         attempts=attempt,
                         records_collected=len(date_results),
                         output_files=output_files,
@@ -2475,8 +2545,11 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
                         "Memory telemetry: "
                         f"date={date_key} rows_inserted={len(date_results)} python_rss_mb={memory.python_rss_mb} "
                         f"chromium_rss_mb={memory.browser_rss_mb} available_ram_mb={memory.available_ram_mb} "
+                        f"chromium_pss_mb={memory.browser_pss_mb} "
                         f"swap_used_mb={memory.swap_used_mb} browser_processes={memory.browser_process_count} "
-                        f"disk_free_gb={memory.disk_free_gb} elapsed_seconds={round(time.perf_counter() - perf_start, 2)}"
+                        f"disk_free_gb={memory.disk_free_gb} profile_size_mb={options.stats.get('profile_directory_size_mb', 0)} "
+                        f"cleanup_remaining={options.stats.get('browser_process_count_after_close', 0)} "
+                        f"elapsed_seconds={round(time.perf_counter() - perf_start, 2)}"
                     )
                     if config.db_backend == "sqlite":
                         wal_busy, wal_pages, wal_checkpointed = sqlite_wal_checkpoint("PASSIVE")
@@ -2487,17 +2560,29 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
                     del raw_results
                     del date_results
                     gc.collect()
-                    completed_count = len([row for row in date_status_rows if row.get("status") in {"completed", "completed_partial", "skipped_resume"}])
+                    completed_count = len(
+                        [
+                            row
+                            for row in date_status_rows
+                            if row.get("status")
+                            in {
+                                "completed",
+                                "completed_partial",
+                                "completed_target_reached",
+                                "completed_results_exhausted",
+                                "completed_resource_safe_limit",
+                                "completed_hard_safety_limit",
+                                "skipped_resume",
+                            }
+                        ]
+                    )
                     if retry_settings.auto_export_partial_excel and should_export_snapshot(completed_count, last_snapshot_time, retry_settings.partial_export_frequency):
                         export_partial("running", snapshot=True)
                         last_snapshot_time = time.monotonic()
                     break
                 except ResourceLimitExceeded as exc:
-                    if hasattr(stop_event, "set"):
-                        try:
-                            stop_event.set("resource_limit")
-                        except TypeError:
-                            stop_event.set()
+                    # A resource emergency is resumable system state, not user
+                    # cancellation. Never poison the user Stop signal.
                     last_error = str(exc)
                     checkpoint = update_checkpoint_date(
                         checkpoint,
@@ -2615,6 +2700,7 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
             stream_sqlite_run_id=run_id if config.db_backend == "sqlite" else None,
         )
         update_collection_run_status(run_id, status, fatal_error, backend=config.db_backend)
+        endurance_path = write_endurance_summary(status, fatal_error)
         checkpoint["status"] = status
         checkpoint.setdefault("output_files", {})["final_excel"] = str(final_excel_path)
         checkpoint.setdefault("output_files", {})["final_csv"] = csv_payload.get("csv_file_path")
@@ -2623,6 +2709,7 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
         queue.put(("complete", {"results": normalized_results, "summary": summary, "excel_file_path": str(final_excel_path), "status": status, **csv_payload}))
         update_status_file(status=status, progress_percent=100.0, current_message=f"Collection finished: {status}", latest_excel_file=str(final_excel_path), **csv_payload, **price_validation_summary(normalized_results))
         log(f"Database run status updated: {status}")
+        log(f"Endurance summary written: {endurance_path}")
         log(f"Excel file created: {final_excel_path}")
         update_heartbeat(HEARTBEAT_FILE, job_id=getattr(queue, "job_id", None), instance_id=INSTANCE_CONFIG.instance_id, current_date=None, status=status, last_log_message=f"Collection finished: {status}")
     except Exception as exc:
@@ -2669,6 +2756,7 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
                 summary = build_summary(status)
                 csv_payload = export_final_csv([], summary, session_id=run_id, log_callback=log)
             update_collection_run_status(run_id, status, error_message, backend=config.db_backend)
+            write_endurance_summary(status, error_message)
         queue.put(("failed", {"status": status, "error": error_message, **csv_payload}))
         put_progress(queue, 1.0, f"Collection finished: {status}")
         update_status_file(status=status, progress_percent=100.0, current_message=f"Collection finished: {status}", last_error=error_message, **csv_payload)
@@ -3169,10 +3257,54 @@ def start_background_job(config: CollectionConfig) -> None:
         # The system worker supervisor owns the scraper process. Streamlit only
         # submits an atomic request and then observes status files.
         request_id = str(uuid4())
-        payload = {"request_id": request_id, "instance_id": INSTANCE_CONFIG.instance_id, "action": "start", "timestamp": datetime.now().isoformat(), "source": config.source, "city": config.city_or_region, "start_date": config.checkin_start.isoformat(), "end_date": config.checkin_end.isoformat(), "max_hotels": config.max_hotels, "env": {"INSTANCE_ID": INSTANCE_CONFIG.instance_id, "INSTANCE_DATA_DIR": str(INSTANCE_CONFIG.data_dir), "DB_BACKEND": config.db_backend}}
-        request_path = INSTANCE_CONFIG.status_dir / "worker_request.json"; request_path.parent.mkdir(parents=True, exist_ok=True); tmp = request_path.with_suffix(".tmp"); tmp.write_text(json.dumps(payload, indent=2)); os.replace(tmp, request_path)
+        job_id = str(uuid4())
+        payload = {
+            "request_id": request_id,
+            "job_id": job_id,
+            "instance_id": INSTANCE_CONFIG.instance_id,
+            "action": "resume" if config.resume_previous_run else "start",
+            "timestamp": datetime.now().isoformat(),
+            "job_config": {
+                "source": config.source,
+                "city_or_region": config.city_or_region,
+                "checkin_start": config.checkin_start.isoformat(),
+                "checkin_end": config.checkin_end.isoformat(),
+                "nights": config.nights,
+                "adults": config.adults,
+                "currency": config.currency,
+                "max_hotels": config.max_hotels,
+                "headless": config.headless,
+                "collect_all_available": config.collect_all_available,
+                "max_scroll_minutes": config.max_scroll_minutes,
+                "selected_star_ratings": list(config.selected_star_ratings),
+                "include_unknown_star_rating": config.include_unknown_star_rating,
+                "debug_mode": config.debug_mode,
+                "screenshots_enabled": config.screenshots_enabled,
+                "fast_mode": config.fast_mode,
+                "performance_mode": config.performance_mode,
+                "block_images_and_fonts": config.block_images_and_fonts,
+                "test_mode": config.test_mode,
+                "db_backend": config.db_backend,
+                "hotels_only": config.hotels_only,
+                "disable_filters_during_complete_collection": config.disable_filters_during_complete_collection,
+                "ultra_reliable_loading_mode": config.ultra_reliable_loading_mode,
+                "resume_previous_run": config.resume_previous_run,
+                "retry_failed_dates_automatically": config.retry_failed_dates_automatically,
+                "max_retries_per_date": config.max_retries_per_date,
+                "continue_if_date_fails": config.continue_if_date_fails,
+                "auto_export_partial_excel": config.auto_export_partial_excel,
+                "partial_export_frequency": config.partial_export_frequency,
+            },
+            "env": {
+                "INSTANCE_ID": INSTANCE_CONFIG.instance_id,
+                "INSTANCE_DATA_DIR": str(INSTANCE_CONFIG.data_dir),
+                "DB_BACKEND": config.db_backend,
+            },
+        }
+        request_path = INSTANCE_CONFIG.status_dir / "worker_request.json"
+        atomic_write_json(request_path, payload)
         write_json_file(STATUS_FILE, {"request_id": request_id, "status": "starting", "current_message": "Request submitted to persistent worker", "last_updated_at": datetime.now().isoformat()})
-        st.session_state.current_job = {"id": request_id, "external": True, "worker_pid": None, "queue": None, "stop_event": None}
+        st.session_state.current_job = {"id": job_id, "request_id": request_id, "external": True, "worker_pid": None, "queue": None, "stop_event": None}
         st.session_state.status = "starting"; st.session_state.status_message = f"Request submitted: {request_id}"; return
     context = multiprocessing.get_context("spawn")
     queue = context.Queue()
@@ -3755,8 +3887,17 @@ def main() -> None:
 
     if stop_clicked and st.session_state.current_job:
         if st.session_state.current_job.get("external"):
-            request_path = INSTANCE_CONFIG.status_dir / "worker_request.json"; tmp = request_path.with_suffix('.tmp')
-            tmp.write_text(json.dumps({"request_id": str(uuid4()), "instance_id": INSTANCE_CONFIG.instance_id, "action": "stop", "timestamp": datetime.now().isoformat()})); os.replace(tmp, request_path)
+            request_path = INSTANCE_CONFIG.status_dir / "worker_request.json"
+            atomic_write_json(
+                request_path,
+                {
+                    "request_id": str(uuid4()),
+                    "job_id": st.session_state.current_job.get("id"),
+                    "instance_id": INSTANCE_CONFIG.instance_id,
+                    "action": "stop",
+                    "timestamp": datetime.now().isoformat(),
+                },
+            )
         else:
             st.session_state.current_job["stop_event"].set("user")
         st.session_state.current_job["stop_requested_at"] = time.monotonic()

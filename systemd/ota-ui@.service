@@ -1,19 +1,20 @@
 [Unit]
 Description=OTA Streamlit UI instance %i
 After=network-online.target
+StartLimitIntervalSec=3600
+StartLimitBurst=5
 [Service]
 User=jf
 Group=jf
 WorkingDirectory=/home/jf/Projects/OTA-SCRAPER-LINUX
 Environment=INSTANCE_ID=instance_%i
-Environment=INSTANCE_NAME=Instance %i
+Environment="INSTANCE_NAME=Instance %i"
 Environment=INSTANCE_PORT=850%i
 Environment=INSTANCE_DATA_DIR=/home/jf/Projects/OTA-SCRAPER-LINUX/data/instances/instance_%i
 Environment=DB_BACKEND=sqlite
+Environment=OTA_EXTERNAL_WORKER=1
 ExecStart=/home/jf/Projects/OTA-SCRAPER-LINUX/.venv/bin/streamlit run app.py --server.port 850%i --server.address 0.0.0.0 --server.headless true
 Restart=on-failure
 RestartSec=10
-StartLimitIntervalSec=3600
-StartLimitBurst=5
 KillMode=control-group
 TimeoutStopSec=45

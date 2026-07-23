@@ -13,6 +13,7 @@ from services.scraper_errors import is_browser_closed_error
 
 
 LogFn = Callable[[str], None] | None
+BROWSER_MARKERS = ("chrome", "chromium", "playwright", "headless_shell")
 
 
 def safe_page_url(page: Any, log: LogFn = None) -> str | None:
@@ -62,6 +63,101 @@ def safe_close_browser(browser: Any = None, context: Any = None, page: Any = Non
         except Exception as exc:
             if log:
                 log(f"Warning: ignored {label} close failure: {exc}")
+
+
+def find_owned_browser_processes(
+    owner_pid: int,
+    *,
+    profile_dir: str | Path | None = None,
+    job_token: str | None = None,
+) -> list[psutil.Process]:
+    """Find only Chromium owned by this scraper tree or its exact launch markers.
+
+    Chromium helpers can be reparented when the Playwright driver exits.  An
+    exact ``--user-data-dir``/job-token match recovers those processes without
+    ever selecting an unrelated interactive Chrome session.
+    """
+
+    found: dict[int, psutil.Process] = {}
+    try:
+        descendants = psutil.Process(int(owner_pid)).children(recursive=True)
+    except (psutil.Error, OSError):
+        descendants = []
+    exact_profile = str(Path(profile_dir).resolve()) if profile_dir else ""
+    token = str(job_token or "").strip()
+    candidates: list[psutil.Process] = list(descendants)
+    if exact_profile or token:
+        candidates.extend(psutil.process_iter(["pid", "name", "cmdline"]))
+    for process in candidates:
+        try:
+            name = str(process.info.get("name") if hasattr(process, "info") else process.name()).lower()
+            cmdline_values = process.info.get("cmdline") if hasattr(process, "info") else process.cmdline()
+            command = " ".join(cmdline_values or [])
+            command_lower = command.lower()
+        except (psutil.Error, OSError, AttributeError):
+            continue
+        if not any(marker in name or marker in command_lower for marker in BROWSER_MARKERS):
+            continue
+        descendant_owned = process in descendants
+        profile_owned = bool(exact_profile and exact_profile in command)
+        token_owned = bool(token and token in command)
+        if descendant_owned or profile_owned or token_owned:
+            found[process.pid] = process
+    return [found[pid] for pid in sorted(found)]
+
+
+def wait_for_owned_browser_exit(
+    owner_pid: int,
+    *,
+    profile_dir: str | Path | None = None,
+    job_token: str | None = None,
+    timeout_seconds: float = 3.0,
+    log: LogFn = None,
+) -> dict[str, Any]:
+    """Wait, then terminate only marked scraper Chromium that survived close."""
+
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    processes = find_owned_browser_processes(owner_pid, profile_dir=profile_dir, job_token=job_token)
+    while processes and time.monotonic() < deadline:
+        time.sleep(0.1)
+        processes = find_owned_browser_processes(owner_pid, profile_dir=profile_dir, job_token=job_token)
+    remaining_before = [process.pid for process in processes]
+    for process in processes:
+        try:
+            process.terminate()
+            if log:
+                log(f"Browser cleanup: SIGTERM sent to owned Chromium PID {process.pid}.")
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.Error as exc:
+            if log:
+                log(f"Browser cleanup: could not terminate owned PID {process.pid}: {exc}")
+    _gone, alive = psutil.wait_procs(processes, timeout=2.0)
+    killed: list[int] = []
+    for process in alive:
+        try:
+            process.kill()
+            killed.append(process.pid)
+            if log:
+                log(f"Browser cleanup: SIGKILL sent to owned Chromium PID {process.pid}.")
+        except psutil.Error:
+            continue
+    if alive:
+        psutil.wait_procs(alive, timeout=1.0)
+    after = find_owned_browser_processes(owner_pid, profile_dir=profile_dir, job_token=job_token)
+    payload = {
+        "owned_before_cleanup": remaining_before,
+        "terminated": [process.pid for process in processes if process.pid not in killed],
+        "killed": killed,
+        "owned_after_cleanup": [process.pid for process in after],
+    }
+    if log:
+        log(
+            "Browser cleanup verification: "
+            f"before={len(remaining_before)} after={len(payload['owned_after_cleanup'])} "
+            f"remaining={payload['owned_after_cleanup']}"
+        )
+    return payload
 
 
 def _profile_lock_owner(lock_path: Path) -> tuple[int | None, str]:

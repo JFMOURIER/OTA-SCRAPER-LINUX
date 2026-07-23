@@ -19,6 +19,20 @@ DATE_TERMINAL_STATUSES = {
     "skipped_resume",
     "stopped_by_user",
     "stopped_resource_limit",
+    "completed_target_reached",
+    "completed_results_exhausted",
+    "completed_resource_safe_limit",
+    "completed_hard_safety_limit",
+}
+
+COMPLETED_DATE_STATUSES = {
+    "completed",
+    "completed_partial",
+    "completed_target_reached",
+    "completed_results_exhausted",
+    "completed_resource_safe_limit",
+    "completed_hard_safety_limit",
+    "skipped_resume",
 }
 
 
@@ -192,7 +206,7 @@ def update_checkpoint_date(
     checkpoint["in_progress_date"] = date_key if status == "running" else None
     checkpoint["last_error"] = error
     checkpoint["last_updated_at"] = now
-    if status == "completed":
+    if status in COMPLETED_DATE_STATUSES - {"skipped_resume"}:
         _append_unique(checkpoint.setdefault("completed_dates", []), date_key)
         checkpoint["last_successful_date"] = date_key
     elif status == "failed_after_retries":
@@ -296,6 +310,6 @@ def final_run_status(date_rows: list[dict[str, Any]], stopped: bool, fatal_error
         return "completed_with_blocked_dates"
     if "failed_after_retries" in statuses:
         return "completed_with_failed_dates"
-    if statuses and statuses <= {"completed", "skipped_resume"}:
+    if statuses and statuses <= COMPLETED_DATE_STATUSES:
         return "completed_all_dates"
     return "completed_with_failed_dates"
