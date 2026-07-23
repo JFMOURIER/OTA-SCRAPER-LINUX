@@ -1513,6 +1513,7 @@ def collector_options_kwargs(config: CollectionConfig, stop_event: Event | None 
         "instance_data_dir": INSTANCE_CONFIG.data_dir,
         "browser_profile_dir": BROWSER_PROFILE_DIR / "jobs" / f"worker_{os.getpid()}" / ("headless" if config.headless else "visible"),
         "partial_dir": PARTIAL_DIR,
+        "resume_partial_results": True,
         "current_attempt": attempt,
     }
 

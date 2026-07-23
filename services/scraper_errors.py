@@ -21,6 +21,10 @@ class AccessRestrictionError(ScraperError):
     reason = "access_restricted"
 
 
+class PaginationUnsupportedError(RecoverableScraperError):
+    reason = "pagination_unsupported"
+
+
 class FatalScraperConfigError(ScraperError):
     reason = "fatal_config"
 

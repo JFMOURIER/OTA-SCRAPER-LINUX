@@ -45,6 +45,8 @@ class CollectorOptions:
     status_callback: StatusCallback | None = None
     partial_results_callback: PartialResultsCallback | None = None
     partial_dir: Path | None = None
+    resume_partial_results: bool = False
+    resource_check_callback: Callable[[], tuple[str, dict[str, object]]] | None = None
     current_attempt: int = 1
     stats: dict[str, object] = field(default_factory=dict)
 
