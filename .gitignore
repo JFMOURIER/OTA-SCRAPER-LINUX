@@ -31,3 +31,10 @@ browser_profile/
 .playwright/
 ms-playwright/
 .streamlit/secrets.toml
+.cache/
+*.tmp
+rclone.conf
+credentials*.json
+client_secret*.json
+oauth*.json
+token*.json

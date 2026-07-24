@@ -303,7 +303,7 @@ class BookingPlaywrightCollector(BaseCollector):
             "checkout": checkout_date.isoformat(),
             "group_adults": adults,
             "group_children": 0,
-            "no_rooms": 1,
+            "no_rooms": max(1, int(options.rooms)),
             "selected_currency": currency,
             "order": "price",
             "src": "searchresults",
@@ -664,7 +664,7 @@ class BookingPlaywrightCollector(BaseCollector):
                     self.log(log_callback, f"Search form verification failed; retrying with direct results URL. Reason: {verify_exc}")
                     self._notify_status(options, "search verification failed; retrying direct URL", progress_percent=29, latest_url=page.url)
                     last_verify_error = verify_exc
-                    for retry_index, retry_url in enumerate(self._search_url_candidates(search_url, city_or_region, checkin_date, checkout_date, adults, currency), start=1):
+                    for retry_index, retry_url in enumerate(self._search_url_candidates(search_url, city_or_region, checkin_date, checkout_date, adults, currency, options.rooms), start=1):
                         try:
                             self.log(log_callback, f"Direct search retry {retry_index}: {retry_url}")
                             page.goto(retry_url, wait_until="domcontentloaded", timeout=45000)
@@ -1021,18 +1021,18 @@ class BookingPlaywrightCollector(BaseCollector):
 
             if not self._open_date_picker(page, log_callback):
                 self.log(log_callback, "Booking.com date picker did not accept the selected dates.")
-                self._apply_hidden_search_inputs(page, city_or_region, checkin_date, checkout_date, adults, currency, log_callback)
+                self._apply_hidden_search_inputs(page, city_or_region, checkin_date, checkout_date, adults, currency, options.rooms, log_callback)
             else:
                 self.log(log_callback, "date picker opened")
                 if not self._select_booking_date(page, checkin_date, "check in date selected", log_callback):
                     self.log(log_callback, "Booking.com date picker did not accept the selected dates.")
-                    self._apply_hidden_search_inputs(page, city_or_region, checkin_date, checkout_date, adults, currency, log_callback)
+                    self._apply_hidden_search_inputs(page, city_or_region, checkin_date, checkout_date, adults, currency, options.rooms, log_callback)
                 elif not self._select_booking_date(page, checkout_date, "check out date selected", log_callback):
                     self.log(log_callback, "Booking.com date picker did not accept the selected dates.")
-                    self._apply_hidden_search_inputs(page, city_or_region, checkin_date, checkout_date, adults, currency, log_callback)
+                    self._apply_hidden_search_inputs(page, city_or_region, checkin_date, checkout_date, adults, currency, options.rooms, log_callback)
             self._screenshot(page, screenshot_dir, "booking_after_dates_selected", options, screenshot_paths, log_callback)
             self._notify_status(options, "dates selected", progress_percent=16)
-            self._apply_hidden_search_inputs(page, city_or_region, checkin_date, checkout_date, adults, currency, log_callback)
+            self._apply_hidden_search_inputs(page, city_or_region, checkin_date, checkout_date, adults, currency, options.rooms, log_callback)
 
             self._set_adults(page, int(adults), log_callback)
             self.log(log_callback, "adults selected")
@@ -1073,10 +1073,10 @@ class BookingPlaywrightCollector(BaseCollector):
                 pass
             return False
 
-    def _apply_hidden_search_inputs(self, page, city_or_region, checkin_date, checkout_date, adults, currency, log_callback: LogCallback | None) -> None:
+    def _apply_hidden_search_inputs(self, page, city_or_region, checkin_date, checkout_date, adults, currency, rooms, log_callback: LogCallback | None) -> None:
         page.evaluate(
             """
-            ({ city, checkin, checkout, adults, currency }) => {
+            ({ city, checkin, checkout, adults, currency, rooms }) => {
                 const form = document.querySelector('form') || document.body;
                 const setInput = (name, value) => {
                     let input = document.querySelector(`input[name="${name}"]`);
@@ -1094,7 +1094,7 @@ class BookingPlaywrightCollector(BaseCollector):
                 setInput('checkin', checkin);
                 setInput('checkout', checkout);
                 setInput('group_adults', adults);
-                setInput('no_rooms', 1);
+                setInput('no_rooms', rooms);
                 setInput('group_children', 0);
                 setInput('selected_currency', currency);
             }
@@ -1104,6 +1104,7 @@ class BookingPlaywrightCollector(BaseCollector):
                 "checkin": checkin_date.isoformat(),
                 "checkout": checkout_date.isoformat(),
                 "adults": int(adults),
+                "rooms": max(1, int(rooms)),
                 "currency": str(currency),
             },
         )
@@ -1314,7 +1315,7 @@ class BookingPlaywrightCollector(BaseCollector):
             f"{prefix}_monthday": value.day,
         }
 
-    def _search_url_candidates(self, original_url: str, city_or_region, checkin_date, checkout_date, adults, currency) -> list[str]:
+    def _search_url_candidates(self, original_url: str, city_or_region, checkin_date, checkout_date, adults, currency, rooms=1) -> list[str]:
         fallback = self._fallback_destination_params(city_or_region)
         params = {
             "ss": city_or_region,
@@ -1322,7 +1323,7 @@ class BookingPlaywrightCollector(BaseCollector):
             "checkout": checkout_date.isoformat(),
             "group_adults": adults,
             "group_children": 0,
-            "no_rooms": 1,
+            "no_rooms": max(1, int(rooms)),
             "selected_currency": currency,
             "order": "price",
             "src": "searchresults",

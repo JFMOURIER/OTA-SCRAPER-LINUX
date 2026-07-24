@@ -93,6 +93,14 @@ class InstanceConfig:
         return self.data_dir / "status" if self.active else BASE_DIR / "data" / "status"
 
     @property
+    def config_dir(self) -> Path:
+        return self.data_dir / "config" if self.active else BASE_DIR / "data" / "config"
+
+    @property
+    def drive_upload_state_dir(self) -> Path:
+        return self.status_dir / "drive_uploads"
+
+    @property
     def status_file(self) -> Path:
         return self.status_dir / "current_job_status.json"
 
@@ -114,7 +122,7 @@ class InstanceConfig:
 
     def ensure_directories(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        for path in [self.export_dir, self.screenshot_dir, self.debug_dir, self.log_dir, self.browser_profile_dir, self.browser_run_profile_root, self.checkpoint_dir, self.partial_dir, self.status_dir]:
+        for path in [self.export_dir, self.screenshot_dir, self.debug_dir, self.log_dir, self.browser_profile_dir, self.browser_run_profile_root, self.checkpoint_dir, self.partial_dir, self.status_dir, self.config_dir, self.drive_upload_state_dir]:
             path.mkdir(parents=True, exist_ok=True)
 
 

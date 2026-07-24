@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RCLONE="${OTA_RCLONE_BIN:-$(command -v rclone || true)}"
+
+require_rclone() {
+  if [[ -z "$RCLONE" ]]; then
+    echo "[ota-drive] rclone is not installed." >&2
+    echo "[ota-drive] Install command: sudo apt install rclone" >&2
+    exit 2
+  fi
+}
+
+case "${1:-status}" in
+  configure)
+    require_rclone
+    echo "[ota-drive] Configure a Google Drive remote named gdrive."
+    echo "[ota-drive] Credentials remain in ~/.config/rclone/rclone.conf."
+    exec "$RCLONE" config
+    ;;
+  test)
+    require_rclone
+    shift
+    exec "$ROOT/.venv/bin/python" "$ROOT/tools/ota_drive.py" test "$@"
+    ;;
+  status)
+    shift || true
+    exec "$ROOT/.venv/bin/python" "$ROOT/tools/ota_drive.py" status "$@"
+    ;;
+  retry-pending)
+    require_rclone
+    shift
+    exec "$ROOT/.venv/bin/python" "$ROOT/tools/ota_drive.py" retry-pending "$@"
+    ;;
+  *)
+    echo "usage: scripts/ota-drive {configure|test|status|retry-pending} [--instance INSTANCE_ID]" >&2
+    exit 2
+    ;;
+esac

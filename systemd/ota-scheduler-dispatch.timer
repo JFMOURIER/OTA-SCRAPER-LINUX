@@ -1,0 +1,12 @@
+[Unit]
+Description=Check configurable OTA scraper schedules every minute
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=60s
+AccuracySec=10s
+Persistent=false
+Unit=ota-scheduler-dispatch.service
+
+[Install]
+WantedBy=timers.target

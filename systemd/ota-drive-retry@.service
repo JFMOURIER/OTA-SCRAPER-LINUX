@@ -1,0 +1,10 @@
+[Unit]
+Description=Retry pending OTA Drive delivery for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jf/Projects/OTA-SCRAPER-LINUX
+ExecStart=/home/jf/Projects/OTA-SCRAPER-LINUX/scripts/ota-drive retry-pending --instance %i
+TimeoutStartSec=3600

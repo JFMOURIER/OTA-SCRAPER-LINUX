@@ -20,7 +20,30 @@ create table if not exists collection_runs (
     csv_downloads_path text null,
     csv_rows_exported bigint null,
     csv_exported_at timestamp null,
-    csv_export_error text null
+    csv_export_error text null,
+    instance_id text null,
+    resolved_start_date date null,
+    resolved_end_date date null,
+    date_mode text null,
+    schedule_slot text null,
+    frequency_configuration text null,
+    excel_export_status text null,
+    excel_downloads_path text null,
+    excel_rows_exported bigint null,
+    excel_exported_at timestamp null,
+    excel_export_error text null,
+    drive_upload_status text null,
+    drive_folder_id text null,
+    drive_remote_directory text null,
+    drive_csv_path text null,
+    drive_excel_path text null,
+    drive_manifest_path text null,
+    drive_uploaded_at timestamp null,
+    drive_upload_error text null,
+    drive_upload_attempts integer null,
+    drive_last_attempt_at timestamp null,
+    drive_csv_checksum text null,
+    drive_excel_checksum text null
 );
 
 alter table collection_runs
@@ -46,6 +69,30 @@ alter table collection_runs
 
 alter table collection_runs
     add column if not exists csv_export_error text;
+
+alter table collection_runs add column if not exists instance_id text;
+alter table collection_runs add column if not exists resolved_start_date date;
+alter table collection_runs add column if not exists resolved_end_date date;
+alter table collection_runs add column if not exists date_mode text;
+alter table collection_runs add column if not exists schedule_slot text;
+alter table collection_runs add column if not exists frequency_configuration text;
+alter table collection_runs add column if not exists excel_export_status text;
+alter table collection_runs add column if not exists excel_downloads_path text;
+alter table collection_runs add column if not exists excel_rows_exported bigint;
+alter table collection_runs add column if not exists excel_exported_at timestamp;
+alter table collection_runs add column if not exists excel_export_error text;
+alter table collection_runs add column if not exists drive_upload_status text;
+alter table collection_runs add column if not exists drive_folder_id text;
+alter table collection_runs add column if not exists drive_remote_directory text;
+alter table collection_runs add column if not exists drive_csv_path text;
+alter table collection_runs add column if not exists drive_excel_path text;
+alter table collection_runs add column if not exists drive_manifest_path text;
+alter table collection_runs add column if not exists drive_uploaded_at timestamp;
+alter table collection_runs add column if not exists drive_upload_error text;
+alter table collection_runs add column if not exists drive_upload_attempts integer;
+alter table collection_runs add column if not exists drive_last_attempt_at timestamp;
+alter table collection_runs add column if not exists drive_csv_checksum text;
+alter table collection_runs add column if not exists drive_excel_checksum text;
 
 create table if not exists hotel_price_results (
     id bigserial primary key,

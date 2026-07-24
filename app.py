@@ -103,6 +103,7 @@ from services.resource_guard import (
     cleanup_owned_browser_processes,
 )
 from services.run_exports import automatic_export_run_csv
+from services.schedule_ui import render_automatic_schedule
 from services.status_reporting import build_status_fields
 from services.scraper_errors import (
     AccessRestrictionError,
@@ -217,6 +218,7 @@ class CollectionConfig:
     continue_if_date_fails: bool = True
     auto_export_partial_excel: bool = False
     partial_export_frequency: str = "every_25_dates"
+    rooms: int = 1
 
 
 @dataclass(slots=True)
@@ -1039,6 +1041,11 @@ def run_background_job_with_fatal_guard(
     except ScraperAlreadyRunning as exc:
         if os.getenv("OTA_SCHEDULED_RUN") == "1":
             put_log(queue, "scheduled_run_skipped_previous_run_active")
+            update_status_file(
+                status="scheduled_run_skipped_previous_run_active",
+                current_message="scheduled_run_skipped_previous_run_active",
+                last_error=None,
+            )
         else:
             record_fatal_error(
                 exc=exc,
@@ -1050,10 +1057,15 @@ def run_background_job_with_fatal_guard(
                 queue=queue,
             )
     except HostConcurrencyLimitReached as exc:
-        put_log(queue, "scheduled_run_skipped_host_concurrency_limit")
+        capacity_status = (
+            "scheduled_run_deferred_host_capacity"
+            if os.getenv("OTA_SCHEDULED_RUN") == "1"
+            else "scheduled_run_skipped_host_concurrency_limit"
+        )
+        put_log(queue, capacity_status)
         update_status_file(
-            status="scheduled_run_skipped_host_concurrency_limit",
-            current_message="scheduled_run_skipped_host_concurrency_limit",
+            status=capacity_status,
+            current_message=capacity_status,
             last_error=None,
         )
     except ConcurrencyUpgradeNotReady as exc:
@@ -1697,6 +1709,7 @@ def collector_options_kwargs(config: CollectionConfig, stop_event: Event | None 
             POLICY_EXPLICIT if config.resume_previous_run else POLICY_DISABLED
         ),
         "current_attempt": attempt,
+        "rooms": max(1, int(config.rooms)),
     }
 
 
@@ -4047,6 +4060,7 @@ def main() -> None:
 
     st.title("Hotel Price Collector")
     render_instance_info()
+    render_automatic_schedule(INSTANCE_CONFIG)
     render_instance_error_panel()
     with st.expander("Startup self check", expanded=False):
         st.json(startup_check)

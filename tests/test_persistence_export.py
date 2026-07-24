@@ -58,7 +58,17 @@ class PersistenceExportTests(unittest.TestCase):
                 workbook = openpyxl.load_workbook(excel_path, read_only=True)
                 self.assertEqual(
                     set(workbook.sheetnames),
-                    {"All Results", "Errors", "Raw API Debug", "By Date Summary", "By Source Summary", "Date Status", "Run Summary"},
+                    {
+                        "All Hotel Results",
+                        "All Results",
+                        "Errors",
+                        "Raw API Debug",
+                        "Daily Summary",
+                        "By Date Summary",
+                        "By Source Summary",
+                        "Date Status",
+                        "Run Summary",
+                    },
                 )
                 workbook.close()
                 with csv_path.open(encoding="utf-8", newline="") as handle:

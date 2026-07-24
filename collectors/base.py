@@ -52,6 +52,7 @@ class CollectorOptions:
     partial_run_id: int | None = None
     resource_check_callback: Callable[[], tuple[str, dict[str, object]]] | None = None
     current_attempt: int = 1
+    rooms: int = 1
     stats: dict[str, object] = field(default_factory=dict)
 
 

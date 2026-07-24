@@ -1,0 +1,12 @@
+[Unit]
+Description=Dispatch configurable OTA scraper schedules
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jf/Projects/OTA-SCRAPER-LINUX
+Environment=OTA_MAX_CONCURRENT_WORKERS=1
+EnvironmentFile=-/etc/ota-scraper/scheduler.conf
+ExecStart=/home/jf/Projects/OTA-SCRAPER-LINUX/.venv/bin/python tools/ota_schedule_dispatcher.py
+TimeoutStartSec=55

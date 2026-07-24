@@ -213,7 +213,7 @@ class AutomaticExportTests(unittest.TestCase):
                     filename=filename,
                 )
             workbook = openpyxl.load_workbook(excel_path, read_only=True)
-            worksheet = workbook["All Results"]
+            worksheet = workbook["All Hotel Results"]
             exported_rows = sum(
                 1 for _ in worksheet.iter_rows(values_only=True)
             ) - 1
@@ -304,11 +304,11 @@ class IsolationAndSchedulingTests(unittest.TestCase):
         )
         self.assertEqual(
             windows["medium_31_120_days"],
-            (date(2026, 8, 24), date(2026, 11, 21)),
+            (date(2026, 8, 24), date(2026, 11, 23)),
         )
         self.assertEqual(
             windows["long_121_365_days"],
-            (date(2026, 11, 22), date(2027, 7, 24)),
+            (date(2026, 11, 24), date(2027, 7, 23)),
         )
         self.assertTrue(validate_contiguous_non_overlapping_windows(anchor))
 
@@ -450,10 +450,13 @@ class ConsolidationTests(unittest.TestCase):
         return ScheduledInstanceDefinition(
             instance_id=instance_id,
             port=port,
-            start_offset_days=0,
-            end_offset_days=1,
             display=f":{port}",
-            timer_schedule="test",
+            drive_folder_id=f"folder-{instance_id}",
+            drive_folder_url=f"https://example.test/{instance_id}",
+            default_frequency_mode="daily",
+            default_interval_minutes=None,
+            default_runs_per_day=1,
+            default_daily_run_times=("00:00",),
             data_dir_override=data_dir,
         )
 

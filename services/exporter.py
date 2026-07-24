@@ -677,11 +677,13 @@ def export_sqlite_run_to_excel(
     workbook = xlsxwriter.Workbook(str(tmp_path), {"constant_memory": True})
     try:
         sheets = {
+            "All Hotel Results": workbook.add_worksheet("All Hotel Results"),
             "All Results": workbook.add_worksheet("All Results"),
             "Errors": workbook.add_worksheet("Errors"),
             "Raw API Debug": workbook.add_worksheet("Raw API Debug"),
         }
         for col, name in enumerate(columns):
+            sheets["All Hotel Results"].write(0, col, name)
             sheets["All Results"].write(0, col, name)
             sheets["Errors"].write(0, col, name)
         for col, name in enumerate(raw_columns):
@@ -690,7 +692,9 @@ def export_sqlite_run_to_excel(
         for batch in iter_sqlite_results_by_run_id(run_id, batch_size=batch_size):
             for result in batch:
                 for col, name in enumerate(columns):
-                    sheets["All Results"].write(result_row, col, _stream_cell(result.get(name)))
+                    value = _stream_cell(result.get(name))
+                    sheets["All Hotel Results"].write(result_row, col, value)
+                    sheets["All Results"].write(result_row, col, value)
                 result_row += 1
                 is_error = str(result.get("collection_status") or "success") != "success"
                 if is_error:
@@ -721,15 +725,18 @@ def export_sqlite_run_to_excel(
                         bucket["price_min"] = price if bucket["price_min"] is None else min(bucket["price_min"], price)
             del batch
 
-        by_date_sheet = workbook.add_worksheet("By Date Summary")
+        by_date_sheet = workbook.add_worksheet("Daily Summary")
+        legacy_by_date_sheet = workbook.add_worksheet("By Date Summary")
         by_date_headers = ["checkin_date", "checkout_date", "hotels_collected", "errors", "lowest_price", "average_price"]
         for col, name in enumerate(by_date_headers):
             by_date_sheet.write(0, col, name)
+            legacy_by_date_sheet.write(0, col, name)
         for row_index, ((checkin, checkout), values) in enumerate(sorted(by_date.items()), start=1):
             count = values["price_count"]
             row = [checkin, checkout, values["hotels"], values["errors"], values["price_min"], values["price_sum"] / count if count else None]
             for col, value in enumerate(row):
                 by_date_sheet.write(row_index, col, value)
+                legacy_by_date_sheet.write(row_index, col, value)
 
         by_source_sheet = workbook.add_worksheet("By Source Summary")
         source_headers = ["source", "hotels_collected", "errors", "lowest_price", "average_price"]
@@ -758,8 +765,9 @@ def export_sqlite_run_to_excel(
             summary_sheet.write(row_index, 0, str(key))
             summary_sheet.write(row_index, 1, _stream_cell(value))
 
-        for sheet in [*sheets.values(), by_date_sheet, by_source_sheet, date_status_sheet, summary_sheet]:
+        for sheet in [*sheets.values(), by_date_sheet, legacy_by_date_sheet, by_source_sheet, date_status_sheet, summary_sheet]:
             sheet.freeze_panes(1, 0)
+        sheets["All Hotel Results"].autofilter(0, 0, max(0, result_row - 1), len(columns) - 1)
         sheets["All Results"].autofilter(0, 0, max(0, result_row - 1), len(columns) - 1)
         for sheet in sheets.values():
             sheet.set_column(0, max(len(columns) - 1, 0), 18)

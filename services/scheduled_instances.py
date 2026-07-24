@@ -5,18 +5,28 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable
 
+from dateutil.relativedelta import relativedelta
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+INSTANCE_ORDER = (
+    "near_30_days",
+    "medium_31_120_days",
+    "long_121_365_days",
+)
 
 
 @dataclass(frozen=True, slots=True)
 class ScheduledInstanceDefinition:
     instance_id: str
     port: int
-    start_offset_days: int
-    end_offset_days: int
     display: str
-    timer_schedule: str
+    drive_folder_id: str
+    drive_folder_url: str
+    default_frequency_mode: str
+    default_interval_minutes: int | None
+    default_runs_per_day: int | None
+    default_daily_run_times: tuple[str, ...]
     data_dir_override: Path | None = None
 
     @property
@@ -29,43 +39,64 @@ class ScheduledInstanceDefinition:
     def date_bucket(self) -> str:
         return self.instance_id
 
+    @property
+    def automatic_window_profile(self) -> str:
+        return self.instance_id
+
     def resolve_window(self, today: date | None = None) -> tuple[date, date]:
         anchor = today or date.today()
-        return (
-            anchor + timedelta(days=self.start_offset_days),
-            anchor + timedelta(days=self.end_offset_days),
-        )
+        return resolve_automatic_windows(anchor)[self.instance_id]
 
 
 SCHEDULED_INSTANCES: dict[str, ScheduledInstanceDefinition] = {
     "near_30_days": ScheduledInstanceDefinition(
         instance_id="near_30_days",
         port=8501,
-        start_offset_days=0,
-        end_offset_days=30,
         display=":101",
-        timer_schedule="minute 05 every hour",
+        drive_folder_id="18kkxujFodzEfoOmhfpBuZI8xDzaoUk8b",
+        drive_folder_url=(
+            "https://drive.google.com/drive/folders/"
+            "18kkxujFodzEfoOmhfpBuZI8xDzaoUk8b?usp=drive_link"
+        ),
+        default_frequency_mode="interval",
+        default_interval_minutes=60,
+        default_runs_per_day=None,
+        default_daily_run_times=(),
     ),
     "medium_31_120_days": ScheduledInstanceDefinition(
         instance_id="medium_31_120_days",
         port=8502,
-        start_offset_days=31,
-        end_offset_days=120,
         display=":102",
-        timer_schedule="00:20 and 12:20 daily",
+        drive_folder_id="1ATZztmP0pS9c0oprzF3LzQKYcpsXtT7S",
+        drive_folder_url=(
+            "https://drive.google.com/drive/folders/"
+            "1ATZztmP0pS9c0oprzF3LzQKYcpsXtT7S?usp=drive_link"
+        ),
+        default_frequency_mode="daily",
+        default_interval_minutes=None,
+        default_runs_per_day=2,
+        default_daily_run_times=("00:20", "12:20"),
     ),
     "long_121_365_days": ScheduledInstanceDefinition(
         instance_id="long_121_365_days",
         port=8503,
-        start_offset_days=121,
-        end_offset_days=365,
         display=":103",
-        timer_schedule="01:35 daily",
+        drive_folder_id="19TNxbw6-ymHmUE2dkrSLyvKwYtjP4H5c",
+        drive_folder_url=(
+            "https://drive.google.com/drive/folders/"
+            "19TNxbw6-ymHmUE2dkrSLyvKwYtjP4H5c?usp=drive_link"
+        ),
+        default_frequency_mode="daily",
+        default_interval_minutes=None,
+        default_runs_per_day=1,
+        default_daily_run_times=("01:35",),
     ),
 }
 
 
 def get_scheduled_instance(instance_id: str) -> ScheduledInstanceDefinition:
+    if "/" in instance_id or "\\" in instance_id or ".." in instance_id:
+        raise ValueError(f"Unsafe scheduled instance ID: {instance_id!r}")
     try:
         return SCHEDULED_INSTANCES[instance_id]
     except KeyError as exc:
@@ -75,13 +106,83 @@ def get_scheduled_instance(instance_id: str) -> ScheduledInstanceDefinition:
         ) from exc
 
 
+def resolve_automatic_windows(anchor_date: date) -> dict[str, tuple[date, date]]:
+    """Resolve the single authoritative rolling one-year horizon.
+
+    Calendar-month boundaries are used for all bucket boundaries.  The hard cap
+    is inclusive and guarantees that no generated stay date exceeds
+    ``anchor_date + 365 days``.
+    """
+
+    near_start = anchor_date
+    medium_start = anchor_date + relativedelta(months=1)
+    long_start = anchor_date + relativedelta(months=4)
+    calendar_horizon_end = (
+        anchor_date + relativedelta(months=12) - timedelta(days=1)
+    )
+    hard_cap_end = anchor_date + timedelta(days=365)
+    windows = {
+        "near_30_days": (
+            near_start,
+            medium_start - timedelta(days=1),
+        ),
+        "medium_31_120_days": (
+            medium_start,
+            long_start - timedelta(days=1),
+        ),
+        "long_121_365_days": (
+            long_start,
+            min(calendar_horizon_end, hard_cap_end),
+        ),
+    }
+    validate_automatic_windows(anchor_date, windows)
+    return windows
+
+
+def validate_automatic_windows(
+    anchor_date: date,
+    windows: dict[str, tuple[date, date]],
+) -> None:
+    if tuple(windows) != INSTANCE_ORDER:
+        raise ValueError("Automatic windows must contain all instances in order")
+    near = windows["near_30_days"]
+    medium = windows["medium_31_120_days"]
+    long = windows["long_121_365_days"]
+    if near[0] != anchor_date:
+        raise ValueError("Near automatic window must begin on the anchor date")
+    if near[1] + timedelta(days=1) != medium[0]:
+        raise ValueError("Gap or overlap between near and medium windows")
+    if medium[1] + timedelta(days=1) != long[0]:
+        raise ValueError("Gap or overlap between medium and long windows")
+    if long[1] > anchor_date + timedelta(days=365):
+        raise ValueError("Long automatic window exceeds the 365-day hard cap")
+    flattened: list[date] = []
+    for start, end in windows.values():
+        if start > end:
+            raise ValueError("Automatic window start exceeds its end")
+        flattened.extend(
+            start + timedelta(days=offset)
+            for offset in range((end - start).days + 1)
+        )
+    if len(flattened) != len(set(flattened)):
+        raise ValueError("Automatic windows overlap")
+    expected = set(
+        anchor_date + timedelta(days=offset)
+        for offset in range((long[1] - anchor_date).days + 1)
+    )
+    if set(flattened) != expected:
+        raise ValueError("Automatic windows contain a gap")
+
+
 def resolved_windows(
     today: date | None = None,
     definitions: Iterable[ScheduledInstanceDefinition] | None = None,
 ) -> dict[str, tuple[date, date]]:
+    anchor = today or date.today()
+    all_windows = resolve_automatic_windows(anchor)
     selected = definitions or SCHEDULED_INSTANCES.values()
     return {
-        definition.instance_id: definition.resolve_window(today)
+        definition.instance_id: all_windows[definition.instance_id]
         for definition in selected
     }
 
@@ -89,11 +190,9 @@ def resolved_windows(
 def validate_contiguous_non_overlapping_windows(
     today: date | None = None,
 ) -> bool:
-    windows = sorted(
-        resolved_windows(today).values(),
-        key=lambda value: value[0],
-    )
-    return all(
-        current_end + timedelta(days=1) == next_start
-        for (_, current_end), (next_start, _) in zip(windows, windows[1:])
-    )
+    try:
+        anchor = today or date.today()
+        validate_automatic_windows(anchor, resolve_automatic_windows(anchor))
+    except ValueError:
+        return False
+    return True

@@ -11,7 +11,13 @@ from typing import Any, Callable
 from uuid import uuid4
 
 import database.db as db
-from services.exporter import export_sqlite_run_to_csv, safe_filename
+import openpyxl
+
+from services.exporter import (
+    export_sqlite_run_to_csv,
+    export_sqlite_run_to_excel,
+    safe_filename,
+)
 from services.instance_config import INSTANCE_CONFIG
 
 
@@ -27,6 +33,7 @@ TERMINAL_RUN_STATUSES = {
     "stopped",
     "stopped_by_user",
     "stopped_by_user_with_partial_results",
+    "stopped_resource_limit",
     "browser_crash",
     "application_exception",
     "fatal_error_with_partial_results",
@@ -49,7 +56,13 @@ def _truthy_environment(name: str, default: bool) -> bool:
 
 
 def _run_date_range(run: dict[str, Any]) -> tuple[str, str]:
-    start = date.fromisoformat(str(run["checkin_date"]))
+    start = date.fromisoformat(
+        str(run.get("resolved_start_date") or run["checkin_date"])
+    )
+    if run.get("resolved_end_date"):
+        return start.isoformat(), date.fromisoformat(
+            str(run["resolved_end_date"])
+        ).isoformat()
     checkout_boundary = date.fromisoformat(str(run["checkout_date"]))
     nights = max(1, int(run.get("number_of_nights") or 1))
     end = checkout_boundary - timedelta(days=nights)
@@ -90,6 +103,18 @@ def _csv_data_rows(path: Path) -> int:
         reader = csv.reader(handle)
         next(reader, None)
         return sum(1 for _ in reader)
+
+
+def _excel_data_rows(path: Path) -> int:
+    workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        worksheet = workbook["All Hotel Results"]
+        return max(
+            0,
+            sum(1 for _ in worksheet.iter_rows(values_only=True)) - 1,
+        )
+    finally:
+        workbook.close()
 
 
 def _atomic_copy_no_overwrite(source: Path, destination: Path) -> Path:
@@ -147,6 +172,14 @@ def _payload(run: dict[str, Any]) -> dict[str, Any]:
         "csv_rows_exported": int(run.get("csv_rows_exported") or 0),
         "csv_exported_at": run.get("csv_exported_at"),
         "csv_export_error": run.get("csv_export_error"),
+        "excel_export_status": run.get("excel_export_status"),
+        "excel_file_path": run.get("excel_file_path"),
+        "excel_downloads_path": run.get("excel_downloads_path"),
+        "excel_rows_exported": int(run.get("excel_rows_exported") or 0),
+        "excel_exported_at": run.get("excel_exported_at"),
+        "excel_export_error": run.get("excel_export_error"),
+        "drive_upload_status": run.get("drive_upload_status"),
+        "drive_upload_error": run.get("drive_upload_error"),
     }
 
 
@@ -371,3 +404,304 @@ def automatic_export_run_csv(
         return _payload(
             db.fetch_collection_run_by_id(run_id, backend="sqlite") or {}
         )
+
+
+def automatic_export_run_excel(
+    run_id: int,
+    *,
+    database_path: str | Path | None = None,
+    instance_id: str | None = None,
+    export_dir: str | Path | None = None,
+    downloads_dir: str | Path | None = None,
+    copy_to_downloads: bool | None = None,
+    log: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    database_path = Path(database_path or db.SQLITE_DB_PATH).resolve()
+    resolved_instance = _resolved_instance_id(database_path, instance_id)
+    resolved_export_dir = Path(export_dir or database_path.parent / "exports")
+    if copy_to_downloads is None:
+        copy_to_downloads = _copy_to_downloads_by_default(database_path)
+    if downloads_dir is None and copy_to_downloads:
+        downloads_dir = Path(
+            os.getenv("OTA_DOWNLOADS_DIR", "/home/jf/Downloads")
+        )
+    resolved_downloads_dir = Path(downloads_dir) if downloads_dir else None
+    lock_path = (
+        database_path.parent / "status" / f"excel_export_run_{run_id}.lock"
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        try:
+            fcntl.flock(
+                lock_handle.fileno(),
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except BlockingIOError:
+            run = db.fetch_collection_run_by_id(run_id, backend="sqlite") or {}
+            payload = _payload(run)
+            payload["excel_export_status"] = (
+                payload.get("excel_export_status") or "in_progress"
+            )
+            return payload
+        run = db.fetch_collection_run_by_id(run_id, backend="sqlite")
+        if run is None:
+            raise ValueError(f"SQLite run {run_id} does not exist")
+        status = str(run.get("status") or "")
+        if status not in TERMINAL_RUN_STATUSES:
+            raise ValueError(
+                f"Run {run_id} is not terminal; current status is {status!r}"
+            )
+        expected_rows = db.count_results_by_run_id(run_id, backend="sqlite")
+        prior_path = Path(str(run.get("excel_file_path") or ""))
+        prior_download = Path(str(run.get("excel_downloads_path") or ""))
+        reusable = (
+            run.get("excel_export_status") == "succeeded"
+            and int(run.get("excel_rows_exported") or -1) == expected_rows
+            and prior_path.is_file()
+            and _excel_data_rows(prior_path) == expected_rows
+            and (
+                not copy_to_downloads
+                or (
+                    prior_download.is_file()
+                    and _sha256(prior_download) == _sha256(prior_path)
+                )
+            )
+        )
+        if reusable:
+            return _payload(run)
+        if expected_rows == 0:
+            db.update_collection_run_excel_export(
+                run_id,
+                status="skipped_no_rows",
+                excel_file_path=None,
+                excel_downloads_path=None,
+                rows_exported=0,
+                exported_at=datetime.now(),
+                error=None,
+                backend="sqlite",
+            )
+            return _payload(
+                db.fetch_collection_run_by_id(run_id, backend="sqlite") or {}
+            )
+        csv_path = Path(str(run.get("csv_file_path") or ""))
+        if csv_path.name.endswith(".csv"):
+            filename = csv_path.with_suffix(".xlsx").name
+            exported_at = datetime.fromisoformat(
+                str(run.get("csv_exported_at") or datetime.now().isoformat())
+            )
+        else:
+            exported_at = datetime.now()
+            filename = build_automatic_csv_filename(
+                run,
+                instance_id=resolved_instance,
+                exported_at=exported_at,
+            ).replace(".csv", ".xlsx")
+        instance_path = resolved_export_dir / filename
+        downloads_path = (
+            resolved_downloads_dir / filename
+            if resolved_downloads_dir is not None
+            else None
+        )
+        can_reuse_existing = (
+            instance_path.is_file()
+            and _excel_data_rows(instance_path) == expected_rows
+        )
+        db.update_collection_run_excel_export(
+            run_id,
+            status="in_progress",
+            excel_file_path=str(instance_path),
+            excel_downloads_path=(
+                str(downloads_path) if downloads_path else None
+            ),
+            rows_exported=expected_rows,
+            exported_at=exported_at,
+            error=None,
+            backend="sqlite",
+        )
+        try:
+            if not can_reuse_existing:
+                start, end = _run_date_range(run)
+                summary = {
+                    "run ID": run_id,
+                    "instance ID": resolved_instance,
+                    "run status": status,
+                    "source": run.get("source"),
+                    "city_or_region": run.get("city_or_region"),
+                    "resolved start date": start,
+                    "resolved end date": end,
+                    "date mode": run.get("date_mode") or "manual",
+                    "schedule slot": run.get("schedule_slot"),
+                    "number_of_nights": run.get("number_of_nights"),
+                    "adults": run.get("adults"),
+                    "currency": run.get("currency"),
+                    "collection started at": run.get("started_at"),
+                    "collection completed at": run.get("completed_at"),
+                    "SQLite row count": expected_rows,
+                }
+                instance_path = export_sqlite_run_to_excel(
+                    run_id,
+                    summary,
+                    resolved_export_dir,
+                    filename=filename,
+                    overwrite_existing=False,
+                )
+            actual_rows = _excel_data_rows(instance_path)
+            if actual_rows != expected_rows:
+                raise RuntimeError(
+                    f"Excel rows ({actual_rows}) do not match SQLite rows "
+                    f"({expected_rows}) for run {run_id}"
+                )
+            if downloads_path is not None:
+                downloads_path = _atomic_copy_no_overwrite(
+                    instance_path,
+                    downloads_path,
+                )
+            db.update_collection_run_excel_export(
+                run_id,
+                status="succeeded",
+                excel_file_path=str(instance_path.resolve()),
+                excel_downloads_path=(
+                    str(downloads_path) if downloads_path else None
+                ),
+                rows_exported=expected_rows,
+                exported_at=exported_at,
+                error=None,
+                backend="sqlite",
+            )
+            if log:
+                log(
+                    f"Automatic run {run_id} Excel exported atomically with "
+                    f"{expected_rows} rows: {instance_path}"
+                )
+        except Exception as exc:
+            db.update_collection_run_excel_export(
+                run_id,
+                status="failed",
+                excel_file_path=(
+                    str(instance_path.resolve())
+                    if instance_path.exists()
+                    else None
+                ),
+                excel_downloads_path=(
+                    str(downloads_path)
+                    if downloads_path is not None and downloads_path.exists()
+                    else None
+                ),
+                rows_exported=expected_rows,
+                exported_at=exported_at,
+                error=str(exc),
+                backend="sqlite",
+            )
+            if log:
+                log(f"Automatic run {run_id} Excel export failed: {exc}")
+        return _payload(
+            db.fetch_collection_run_by_id(run_id, backend="sqlite") or {}
+        )
+
+
+def automatic_export_run_bundle(
+    run_id: int,
+    *,
+    database_path: str | Path | None = None,
+    instance_id: str | None = None,
+    export_dir: str | Path | None = None,
+    downloads_dir: str | Path | None = None,
+    copy_to_downloads: bool | None = None,
+    log: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Publish complete local CSV/Excel artifacts before optional Drive upload."""
+
+    database_path = Path(database_path or db.SQLITE_DB_PATH).resolve()
+    resolved_instance = _resolved_instance_id(database_path, instance_id)
+    resolved_export_dir = Path(export_dir or database_path.parent / "exports")
+    lock_path = (
+        database_path.parent / "status" / f"bundle_export_run_{run_id}.lock"
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        try:
+            fcntl.flock(
+                lock_handle.fileno(),
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except BlockingIOError:
+            run = db.fetch_collection_run_by_id(run_id, backend="sqlite") or {}
+            return _payload(run)
+        csv_payload = automatic_export_run_csv(
+            run_id,
+            database_path=database_path,
+            instance_id=resolved_instance,
+            export_dir=resolved_export_dir,
+            downloads_dir=downloads_dir,
+            copy_to_downloads=copy_to_downloads,
+            log=log,
+        )
+        excel_payload = automatic_export_run_excel(
+            run_id,
+            database_path=database_path,
+            instance_id=resolved_instance,
+            export_dir=resolved_export_dir,
+            downloads_dir=downloads_dir,
+            copy_to_downloads=copy_to_downloads,
+            log=log,
+        )
+        run = db.fetch_collection_run_by_id(run_id, backend="sqlite") or {}
+        expected_rows = db.count_results_by_run_id(run_id, backend="sqlite")
+        run["authoritative_row_count"] = expected_rows
+        local_success = (
+            csv_payload.get("csv_export_status") == "succeeded"
+            and excel_payload.get("excel_export_status") == "succeeded"
+            and int(csv_payload.get("csv_rows_exported") or -1)
+            == expected_rows
+            and int(excel_payload.get("excel_rows_exported") or -1)
+            == expected_rows
+        )
+        try:
+            from services.schedule_config import (
+                load_schedule,
+                record_schedule_event,
+            )
+
+            schedule = load_schedule(
+                resolved_instance,
+                data_dir=database_path.parent,
+            )
+            record_schedule_event(
+                resolved_instance,
+                (
+                    "local_export_succeeded"
+                    if local_success
+                    else "local_export_failed"
+                ),
+                data_dir=database_path.parent,
+                run_id=run_id,
+                local_export_status=(
+                    "succeeded" if local_success else "failed"
+                ),
+            )
+            if local_success and schedule["drive_upload_enabled"]:
+                from services.drive_delivery import upload_run_bundle
+
+                drive = upload_run_bundle(
+                    resolved_instance,
+                    run,
+                    data_dir=database_path.parent,
+                    csv_path=str(csv_payload["csv_file_path"]),
+                    excel_path=str(excel_payload["excel_file_path"]),
+                    folder_id=schedule["drive_folder_id"],
+                    upload_csv=schedule["upload_csv"],
+                    upload_excel=schedule["upload_excel"],
+                )
+                run.update(drive)
+            elif local_success:
+                run["drive_upload_status"] = "not_configured"
+        except Exception as exc:
+            # Delivery is an independent concern.  Never reclassify or erase a
+            # successfully collected SQLite run because scheduling/Drive failed.
+            run["drive_upload_status"] = run.get("drive_upload_status") or "failed"
+            run["drive_upload_error"] = str(exc)
+            if log:
+                log(f"Drive delivery for run {run_id} failed independently: {exc}")
+        run.update(csv_payload)
+        run.update(excel_payload)
+        return _payload(run)

@@ -40,6 +40,8 @@ def prepare_instance_directories() -> list[str]:
             definition.data_dir / "exports",
             definition.data_dir / "partial",
             definition.data_dir / "status",
+            definition.data_dir / "status" / "drive_uploads",
+            definition.data_dir / "config",
             definition.data_dir / "logs",
             definition.data_dir / "debug",
             definition.data_dir / "checkpoints",

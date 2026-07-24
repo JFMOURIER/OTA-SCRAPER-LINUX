@@ -1,0 +1,18 @@
+[Unit]
+Description=OTA Streamlit UI - Medium 31-120 Days
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jf/Projects/OTA-SCRAPER-LINUX
+EnvironmentFile=/home/jf/Projects/OTA-SCRAPER-LINUX/config/instances/medium_31_120_days.conf
+Environment=OTA_UI_UNIT=ota-ui-medium.service
+ExecStart=/home/jf/Projects/OTA-SCRAPER-LINUX/scripts/ota-ui serve
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=25
+
+[Install]
+WantedBy=default.target

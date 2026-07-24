@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import json
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterator
@@ -71,7 +71,7 @@ def create_collection_run(
     backend: str | None = None,
 ) -> int:
     if normalize_backend(backend) == "postgres":
-        return _create_collection_run_postgres(
+        run_id = _create_collection_run_postgres(
             source,
             city_or_region,
             checkin_date,
@@ -85,20 +85,43 @@ def create_collection_run(
             include_unknown_star_rating,
             job_signature, job_signature_hash,
         )
-    return _create_collection_run_sqlite(
-        source,
-        city_or_region,
-        checkin_date,
-        checkout_date,
-        number_of_nights,
-        adults,
-        currency,
-        max_hotels,
-        status,
-        selected_star_ratings,
-        include_unknown_star_rating,
-        job_signature, job_signature_hash,
+    else:
+        run_id = _create_collection_run_sqlite(
+            source,
+            city_or_region,
+            checkin_date,
+            checkout_date,
+            number_of_nights,
+            adults,
+            currency,
+            max_hotels,
+            status,
+            selected_star_ratings,
+            include_unknown_star_rating,
+            job_signature, job_signature_hash,
+        )
+    resolved_end = checkout_date - timedelta(
+        days=max(1, int(number_of_nights))
     )
+    update_collection_run_schedule_metadata(
+        run_id,
+        instance_id=os.getenv("INSTANCE_ID", INSTANCE_CONFIG.instance_id),
+        resolved_start_date=os.getenv(
+            "OTA_RESOLVED_START_DATE",
+            checkin_date.isoformat(),
+        ),
+        resolved_end_date=os.getenv(
+            "OTA_RESOLVED_END_DATE",
+            resolved_end.isoformat(),
+        ),
+        date_mode=os.getenv("OTA_SCHEDULE_DATE_MODE", "manual"),
+        schedule_slot=os.getenv("OTA_SCHEDULE_SLOT"),
+        frequency_configuration=os.getenv(
+            "OTA_SCHEDULE_FREQUENCY_JSON"
+        ),
+        backend=backend,
+    )
+    return run_id
 
 
 def insert_hotel_results(results: list[dict[str, Any]], backend: str | None = None) -> int:
@@ -126,12 +149,15 @@ def update_collection_run_status(
     ).strip().lower() not in {"0", "false", "no", "off"}
     if not auto_export_enabled:
         return None
-    from services.run_exports import TERMINAL_RUN_STATUSES, automatic_export_run_csv
+    from services.run_exports import (
+        TERMINAL_RUN_STATUSES,
+        automatic_export_run_bundle,
+    )
 
     if status not in TERMINAL_RUN_STATUSES:
         return None
     try:
-        return automatic_export_run_csv(
+        return automatic_export_run_bundle(
             run_id,
             database_path=SQLITE_DB_PATH,
             instance_id=INSTANCE_CONFIG.instance_id,
@@ -157,6 +183,8 @@ def update_collection_run_status(
             "csv_rows_exported": 0,
             "csv_exported_at": None,
             "csv_export_error": str(exc),
+            "excel_export_status": "failed",
+            "excel_export_error": str(exc),
         }
 
 
@@ -240,6 +268,132 @@ def update_collection_run_csv_export(
                 error,
                 run_id,
             ),
+        )
+        conn.commit()
+
+
+def update_collection_run_excel_export(
+    run_id: int,
+    *,
+    status: str,
+    excel_file_path: str | None,
+    excel_downloads_path: str | None,
+    rows_exported: int,
+    exported_at: datetime | str | None,
+    error: str | None,
+    backend: str | None = None,
+) -> None:
+    values = {
+        "excel_export_status": status,
+        "excel_file_path": excel_file_path,
+        "excel_downloads_path": excel_downloads_path,
+        "excel_rows_exported": rows_exported,
+        "excel_exported_at": _serialize(exported_at),
+        "excel_export_error": error,
+    }
+    _update_collection_run_fields(run_id, values, backend=backend)
+
+
+def update_collection_run_schedule_metadata(
+    run_id: int,
+    *,
+    instance_id: str,
+    resolved_start_date: date | str,
+    resolved_end_date: date | str,
+    date_mode: str,
+    schedule_slot: str | None,
+    frequency_configuration: Any,
+    backend: str | None = None,
+) -> None:
+    _update_collection_run_fields(
+        run_id,
+        {
+            "instance_id": instance_id,
+            "resolved_start_date": resolved_start_date,
+            "resolved_end_date": resolved_end_date,
+            "date_mode": date_mode,
+            "schedule_slot": schedule_slot,
+            "frequency_configuration": frequency_configuration,
+        },
+        backend=backend,
+    )
+
+
+DELIVERY_FIELDS = {
+    "drive_upload_status",
+    "drive_folder_id",
+    "drive_remote_directory",
+    "drive_csv_path",
+    "drive_excel_path",
+    "drive_manifest_path",
+    "drive_uploaded_at",
+    "drive_upload_error",
+    "drive_upload_attempts",
+    "drive_last_attempt_at",
+    "drive_csv_checksum",
+    "drive_excel_checksum",
+}
+
+
+def update_collection_run_delivery(
+    run_id: int,
+    *,
+    backend: str | None = None,
+    **values: Any,
+) -> None:
+    unexpected = sorted(set(values) - DELIVERY_FIELDS)
+    if unexpected:
+        raise ValueError(
+            "Unsupported Drive metadata fields: " + ", ".join(unexpected)
+        )
+    _update_collection_run_fields(run_id, values, backend=backend)
+
+
+def _update_collection_run_fields(
+    run_id: int,
+    values: dict[str, Any],
+    *,
+    backend: str | None = None,
+) -> None:
+    if not values:
+        return
+    allowed = {
+        "instance_id",
+        "resolved_start_date",
+        "resolved_end_date",
+        "date_mode",
+        "schedule_slot",
+        "frequency_configuration",
+        "excel_export_status",
+        "excel_file_path",
+        "excel_downloads_path",
+        "excel_rows_exported",
+        "excel_exported_at",
+        "excel_export_error",
+        *DELIVERY_FIELDS,
+    }
+    unexpected = sorted(set(values) - allowed)
+    if unexpected:
+        raise ValueError(
+            "Unsupported collection run fields: " + ", ".join(unexpected)
+        )
+    fields = list(values)
+    serialized = [_serialize(values[field]) for field in fields]
+    if normalize_backend(backend) == "postgres":
+        assignments = ", ".join(f"{field} = %s" for field in fields)
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"update collection_runs set {assignments} where id = %s",
+                    (*serialized, run_id),
+                )
+            conn.commit()
+        return
+    assignments = ", ".join(f"{field} = ?" for field in fields)
+    with _sqlite_connection() as conn:
+        conn.execute(
+            f"update collection_runs set {assignments} where id = ?",
+            (*serialized, run_id),
         )
         conn.commit()
 
@@ -569,6 +723,29 @@ def _ensure_sqlite_columns(conn: sqlite3.Connection) -> None:
         "csv_rows_exported": "integer",
         "csv_exported_at": "text",
         "csv_export_error": "text",
+        "instance_id": "text",
+        "resolved_start_date": "text",
+        "resolved_end_date": "text",
+        "date_mode": "text",
+        "schedule_slot": "text",
+        "frequency_configuration": "text",
+        "excel_export_status": "text",
+        "excel_downloads_path": "text",
+        "excel_rows_exported": "integer",
+        "excel_exported_at": "text",
+        "excel_export_error": "text",
+        "drive_upload_status": "text",
+        "drive_folder_id": "text",
+        "drive_remote_directory": "text",
+        "drive_csv_path": "text",
+        "drive_excel_path": "text",
+        "drive_manifest_path": "text",
+        "drive_uploaded_at": "text",
+        "drive_upload_error": "text",
+        "drive_upload_attempts": "integer",
+        "drive_last_attempt_at": "text",
+        "drive_csv_checksum": "text",
+        "drive_excel_checksum": "text",
     }
     for column, column_type in additions.items():
         if column not in existing:

@@ -43,7 +43,7 @@ class ExpediaPlaywrightCollector(BaseCollector):
             "destination": city_or_region,
             "startDate": checkin_date.isoformat(),
             "endDate": checkout_date.isoformat(),
-            "rooms": f"1:{adults}",
+            "rooms": f"{max(1, int(options.rooms))}:{adults}",
         }
         search_url = f"https://www.expedia.com/Hotel-Search?{urlencode(params)}"
         screenshot_dir = options.screenshot_dir or Path("data") / "screenshots"

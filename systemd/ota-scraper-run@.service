@@ -1,0 +1,17 @@
+[Unit]
+Description=Run one configurable OTA scraper slot for %i
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=3600
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jf/Projects/OTA-SCRAPER-LINUX
+Environment=OTA_MAX_CONCURRENT_WORKERS=1
+EnvironmentFile=-/etc/ota-scraper/scheduler.conf
+ExecStart=/usr/bin/systemd-inhibit --what=sleep:idle --who=OTA-SCRAPER --why=Scheduled-OTA-scrape --mode=block /home/jf/Projects/OTA-SCRAPER-LINUX/.venv/bin/python tools/ota_scheduled_run.py %i
+Restart=on-failure
+RestartSec=30
+KillMode=control-group
+TimeoutStopSec=300
