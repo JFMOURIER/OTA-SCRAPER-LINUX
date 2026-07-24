@@ -31,6 +31,14 @@ class ScraperAlreadyRunning(RuntimeError):
     pass
 
 
+class HostConcurrencyLimitReached(RuntimeError):
+    pass
+
+
+class ConcurrencyUpgradeNotReady(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class ResourceThresholds:
     minimum_start_available_mb: int = 800
@@ -248,7 +256,7 @@ class ResourceGuard:
 
 
 class SingleScraperLock:
-    """An advisory host-wide lock. The open descriptor owns the lock."""
+    """An advisory per-instance lock. The open descriptor owns the lock."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -281,6 +289,90 @@ class SingleScraperLock:
             self._handle = None
 
     def __enter__(self) -> "SingleScraperLock":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.release()
+
+
+class HostWorkerSemaphore:
+    """Non-blocking host semaphore backed by advisory slot files."""
+
+    def __init__(
+        self,
+        state_dir: str | Path,
+        *,
+        maximum_workers: int | None = None,
+    ) -> None:
+        self.state_dir = Path(state_dir)
+        self.maximum_workers = (
+            self._configured_maximum()
+            if maximum_workers is None
+            else max(1, min(3, int(maximum_workers)))
+        )
+        self._handle = None
+        self.slot: int | None = None
+
+    @staticmethod
+    def _configured_maximum() -> int:
+        try:
+            requested = int(
+                os.getenv("OTA_MAX_CONCURRENT_WORKERS", "1")
+            )
+        except ValueError:
+            requested = 1
+        requested = max(1, min(3, requested))
+        if requested > 1:
+            from services.hardware_preflight import (
+                three_worker_concurrency_enabled,
+            )
+
+            if not three_worker_concurrency_enabled():
+                raise ConcurrencyUpgradeNotReady(
+                    "Concurrent workers remain disabled until the 32 GB "
+                    "hardware preflight passes and concurrency is explicitly enabled."
+                )
+        return requested
+
+    def acquire(self, *, instance_id: str, job_id: str) -> int:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        for slot in range(1, self.maximum_workers + 1):
+            path = self.state_dir / f"host_worker_slot_{slot}.lock"
+            handle = path.open("a+", encoding="utf-8")
+            try:
+                fcntl.flock(
+                    handle.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except BlockingIOError:
+                handle.close()
+                continue
+            handle.seek(0)
+            handle.truncate()
+            handle.write(
+                f"pid={os.getpid()} instance={instance_id} job_id={job_id} "
+                f"started={time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+            self._handle = handle
+            self.slot = slot
+            return slot
+        raise HostConcurrencyLimitReached(
+            f"All {self.maximum_workers} configured host worker slot(s) are active"
+        )
+
+    def release(self) -> None:
+        if self._handle is None:
+            return
+        try:
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._handle.close()
+            self._handle = None
+            self.slot = None
+
+    def __enter__(self) -> "HostWorkerSemaphore":
         return self
 
     def __exit__(self, *_args: object) -> None:

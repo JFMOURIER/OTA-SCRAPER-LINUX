@@ -1,0 +1,11 @@
+[Unit]
+Description=Run medium-window OTA scraper at 00:20 and 12:20
+
+[Timer]
+OnCalendar=*-*-* 00,12:20:00
+AccuracySec=1min
+Persistent=false
+Unit=ota-scraper-medium.service
+
+[Install]
+WantedBy=timers.target

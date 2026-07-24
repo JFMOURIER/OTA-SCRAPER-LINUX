@@ -1,0 +1,20 @@
+[Unit]
+Description=OTA scheduled scraper - medium 31-120 day window
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=3600
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+User=jf
+Group=jf
+WorkingDirectory=/home/jf/Projects/OTA-SCRAPER-LINUX
+EnvironmentFile=/home/jf/Projects/OTA-SCRAPER-LINUX/config/instances/medium_31_120_days.conf
+Environment=OTA_MAX_CONCURRENT_WORKERS=1
+EnvironmentFile=-/etc/ota-scraper/scheduler.conf
+ExecStart=/usr/bin/systemd-inhibit --what=sleep:idle --who=OTA-SCRAPER --why=Scheduled-OTA-scrape --mode=block /home/jf/Projects/OTA-SCRAPER-LINUX/.venv/bin/python tools/ota_scheduled_run.py medium_31_120_days
+Restart=on-failure
+RestartSec=30
+KillMode=control-group
+TimeoutStopSec=300

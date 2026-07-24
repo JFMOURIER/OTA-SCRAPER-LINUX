@@ -109,11 +109,139 @@ def insert_hotel_results(results: list[dict[str, Any]], backend: str | None = No
     return _insert_hotel_results_sqlite(results)
 
 
-def update_collection_run_status(run_id: int, status: str, error_message: str | None = None, backend: str | None = None) -> None:
-    if normalize_backend(backend) == "postgres":
+def update_collection_run_status(
+    run_id: int,
+    status: str,
+    error_message: str | None = None,
+    backend: str | None = None,
+) -> dict[str, Any] | None:
+    normalized_backend = normalize_backend(backend)
+    if normalized_backend == "postgres":
         _update_collection_run_status_postgres(run_id, status, error_message)
-    else:
-        _update_collection_run_status_sqlite(run_id, status, error_message)
+        return None
+    _update_collection_run_status_sqlite(run_id, status, error_message)
+    auto_export_enabled = os.getenv(
+        "OTA_AUTO_EXPORT_ENABLED",
+        "1",
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    if not auto_export_enabled:
+        return None
+    from services.run_exports import TERMINAL_RUN_STATUSES, automatic_export_run_csv
+
+    if status not in TERMINAL_RUN_STATUSES:
+        return None
+    try:
+        return automatic_export_run_csv(
+            run_id,
+            database_path=SQLITE_DB_PATH,
+            instance_id=INSTANCE_CONFIG.instance_id,
+        )
+    except Exception as exc:
+        try:
+            update_collection_run_csv_export(
+                run_id,
+                status="failed",
+                csv_file_path=None,
+                csv_downloads_path=None,
+                rows_exported=count_results_by_run_id(run_id, backend="sqlite"),
+                exported_at=datetime.now(),
+                error=str(exc),
+                backend="sqlite",
+            )
+        except Exception:
+            pass
+        return {
+            "csv_export_status": "failed",
+            "csv_file_path": None,
+            "csv_downloads_path": None,
+            "csv_rows_exported": 0,
+            "csv_exported_at": None,
+            "csv_export_error": str(exc),
+        }
+
+
+def fetch_collection_run_by_id(
+    run_id: int,
+    backend: str | None = None,
+) -> dict[str, Any] | None:
+    if normalize_backend(backend) == "postgres":
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("select * from collection_runs where id = %s", (run_id,))
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                columns = [description.name for description in cur.description]
+                return dict(zip(columns, row))
+    with _sqlite_connection() as conn:
+        row = conn.execute(
+            "select * from collection_runs where id = ?",
+            (run_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+
+def update_collection_run_csv_export(
+    run_id: int,
+    *,
+    status: str,
+    csv_file_path: str | None,
+    csv_downloads_path: str | None,
+    rows_exported: int,
+    exported_at: datetime | str | None,
+    error: str | None,
+    backend: str | None = None,
+) -> None:
+    exported_value = _serialize(exported_at)
+    if normalize_backend(backend) == "postgres":
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    update collection_runs
+                    set csv_export_status = %s,
+                        csv_file_path = %s,
+                        csv_downloads_path = %s,
+                        csv_rows_exported = %s,
+                        csv_exported_at = %s,
+                        csv_export_error = %s
+                    where id = %s
+                    """,
+                    (
+                        status,
+                        csv_file_path,
+                        csv_downloads_path,
+                        rows_exported,
+                        exported_value,
+                        error,
+                        run_id,
+                    ),
+                )
+            conn.commit()
+        return
+    with _sqlite_connection() as conn:
+        conn.execute(
+            """
+            update collection_runs
+            set csv_export_status = ?,
+                csv_file_path = ?,
+                csv_downloads_path = ?,
+                csv_rows_exported = ?,
+                csv_exported_at = ?,
+                csv_export_error = ?
+            where id = ?
+            """,
+            (
+                status,
+                csv_file_path,
+                csv_downloads_path,
+                rows_exported,
+                exported_value,
+                error,
+                run_id,
+            ),
+        )
+        conn.commit()
 
 
 def update_collection_run_excel_path(run_id: int, excel_file_path: str, backend: str | None = None) -> None:
@@ -356,6 +484,12 @@ def _init_sqlite() -> None:
                 include_unknown_star_rating integer
                 ,job_signature text
                 ,job_signature_hash text
+                ,csv_export_status text
+                ,csv_file_path text
+                ,csv_downloads_path text
+                ,csv_rows_exported integer
+                ,csv_exported_at text
+                ,csv_export_error text
             );
 
             create table if not exists hotel_price_results (
@@ -429,6 +563,12 @@ def _ensure_sqlite_columns(conn: sqlite3.Connection) -> None:
         "include_unknown_star_rating": "integer",
         "job_signature": "text",
         "job_signature_hash": "text",
+        "csv_export_status": "text",
+        "csv_file_path": "text",
+        "csv_downloads_path": "text",
+        "csv_rows_exported": "integer",
+        "csv_exported_at": "text",
+        "csv_export_error": "text",
     }
     for column, column_type in additions.items():
         if column not in existing:
@@ -479,12 +619,15 @@ def _terminal_completed_at(status: str) -> datetime | None:
         "fatal_config_error",
         "completed_with_partial_results",
         "completed_with_zero_results",
+        "completed_incomplete",
         "failed",
         "blocked_or_access_restricted",
+        "stopped",
         "stopped_by_user",
         "stopped_resource_limit",
         "browser_crash",
         "application_exception",
+        "fatal_startup_error",
     }
     return datetime.now() if status in terminal_statuses else None
 

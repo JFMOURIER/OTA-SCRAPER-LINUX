@@ -1,0 +1,14 @@
+[Unit]
+Description=Isolated Xvfb display :%i for OTA scraper
+After=network.target
+
+[Service]
+Type=simple
+User=jf
+Group=jf
+ExecStart=/usr/bin/Xvfb :%i -screen 0 1920x1080x24 -nolisten tcp -noreset
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

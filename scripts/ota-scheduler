@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+UNITS=(
+  ota-scraper-near.service
+  ota-scraper-near.timer
+  ota-scraper-medium.service
+  ota-scraper-medium.timer
+  ota-scraper-long.service
+  ota-scraper-long.timer
+  ota-xvfb@.service
+)
+
+case "${1:-status}" in
+  prepare)
+    exec "$ROOT/.venv/bin/python" "$ROOT/tools/ota_scheduler.py" prepare
+    ;;
+  preflight)
+    exec "$ROOT/.venv/bin/python" "$ROOT/tools/ota_scheduler.py" preflight
+    ;;
+  enable-concurrency)
+    exec "$ROOT/.venv/bin/python" "$ROOT/tools/ota_scheduler.py" enable-concurrency
+    ;;
+  install)
+    for unit in "${UNITS[@]}"; do
+      sudo install -m 0644 "$ROOT/systemd/$unit" "/etc/systemd/system/$unit"
+    done
+    sudo mkdir -p /etc/ota-scraper
+    if [[ ! -e /etc/ota-scraper/scheduler.conf ]]; then
+      sudo install -m 0644 "$ROOT/config/scheduler.conf.example" /etc/ota-scraper/scheduler.conf
+    fi
+    sudo systemctl daemon-reload
+    echo "Installed scheduler units with OTA_MAX_CONCURRENT_WORKERS=1."
+    ;;
+  enable-timers)
+    sudo systemctl enable --now \
+      ota-scraper-near.timer \
+      ota-scraper-medium.timer \
+      ota-scraper-long.timer
+    ;;
+  disable-timers)
+    sudo systemctl disable --now \
+      ota-scraper-near.timer \
+      ota-scraper-medium.timer \
+      ota-scraper-long.timer
+    ;;
+  status)
+    systemctl --no-pager --full status \
+      ota-scraper-near.timer \
+      ota-scraper-medium.timer \
+      ota-scraper-long.timer || true
+    ;;
+  *)
+    echo "usage: scripts/ota-scheduler {prepare|preflight|enable-concurrency|install|enable-timers|disable-timers|status}" >&2
+    exit 2
+    ;;
+esac

@@ -38,6 +38,7 @@ from database.db import (
     SQLITE_DB_PATH,
     create_collection_run,
     count_results_by_run_id,
+    fetch_collection_run_by_id,
     fetch_collection_runs,
     fetch_latest_results,
     fetch_results_by_run_id,
@@ -62,6 +63,7 @@ from services.exporter import (
     export_results_to_csv,
     export_sqlite_run_to_csv,
     export_sqlite_run_to_excel,
+    next_available_run_excel_filename,
     safe_filename,
 )
 from services.instance_config import INSTANCE_CONFIG
@@ -91,12 +93,16 @@ from services.partial_policy import (
     write_partial_metadata,
 )
 from services.resource_guard import (
+    ConcurrencyUpgradeNotReady,
+    HostConcurrencyLimitReached,
+    HostWorkerSemaphore,
     ResourceGuard,
     ResourceLimitExceeded,
     ScraperAlreadyRunning,
     SingleScraperLock,
     cleanup_owned_browser_processes,
 )
+from services.run_exports import automatic_export_run_csv
 from services.status_reporting import build_status_fields
 from services.scraper_errors import (
     AccessRestrictionError,
@@ -1010,12 +1016,20 @@ def run_background_job_with_fatal_guard(
     queue.instance_log_file = log_file
     current_step = "background_job_start"
     lock = SingleScraperLock(SCRAPER_LOCK_FILE)
+    host_semaphore: HostWorkerSemaphore | None = None
 
     def cleanup_log(message: str) -> None:
         put_log(queue, message)
 
     try:
         lock.acquire(job_id)
+        host_semaphore = HostWorkerSemaphore(
+            BASE_DIR / "data" / "scheduler"
+        )
+        host_semaphore.acquire(
+            instance_id=INSTANCE_CONFIG.instance_id,
+            job_id=job_id,
+        )
         guard = ResourceGuard(INSTANCE_CONFIG.data_dir, owner_pid=os.getpid())
         queue.resource_guard = guard
         initial = guard.check(starting=True, force=True)
@@ -1023,14 +1037,31 @@ def run_background_job_with_fatal_guard(
         put_metrics(queue, {**initial.as_dict(), "resource_guard_level": guard.last_level})
         runner(config, stop_event, queue)
     except ScraperAlreadyRunning as exc:
-        record_fatal_error(
-            exc=exc,
-            job_id=job_id,
-            status="refused_second_scraper",
-            current_step=current_step,
-            current_date=None,
-            log_file=log_file,
-            queue=queue,
+        if os.getenv("OTA_SCHEDULED_RUN") == "1":
+            put_log(queue, "scheduled_run_skipped_previous_run_active")
+        else:
+            record_fatal_error(
+                exc=exc,
+                job_id=job_id,
+                status="refused_second_scraper",
+                current_step=current_step,
+                current_date=None,
+                log_file=log_file,
+                queue=queue,
+            )
+    except HostConcurrencyLimitReached as exc:
+        put_log(queue, "scheduled_run_skipped_host_concurrency_limit")
+        update_status_file(
+            status="scheduled_run_skipped_host_concurrency_limit",
+            current_message="scheduled_run_skipped_host_concurrency_limit",
+            last_error=None,
+        )
+    except ConcurrencyUpgradeNotReady as exc:
+        put_log(queue, f"concurrency_upgrade_not_ready: {exc}")
+        update_status_file(
+            status="concurrency_upgrade_not_ready",
+            current_message=str(exc),
+            last_error=None,
         )
     except ResourceLimitExceeded as exc:
         update_status_file(
@@ -1056,6 +1087,8 @@ def run_background_job_with_fatal_guard(
         )
     finally:
         cleanup_owned_browser_processes(os.getpid(), cleanup_log)
+        if host_semaphore is not None:
+            host_semaphore.release()
         lock.release()
 
 
@@ -1215,13 +1248,18 @@ def export_final_csv(
     summary["instance_id"] = INSTANCE_CONFIG.instance_id
     row_count = count_results_by_run_id(stream_sqlite_run_id, backend="sqlite") if stream_sqlite_run_id is not None else len(results)
     try:
-        if stream_sqlite_run_id is not None:
-            csv_path = export_sqlite_run_to_csv(
-                stream_sqlite_run_id,
-                summary,
-                EXPORT_DIR,
+        sqlite_run_id = stream_sqlite_run_id
+        if sqlite_run_id is not None:
+            payload = automatic_export_run_csv(
+                sqlite_run_id,
+                database_path=SQLITE_DB_PATH,
                 instance_id=INSTANCE_CONFIG.instance_id,
+                export_dir=EXPORT_DIR,
+                log=log_callback,
             )
+            payload["csv_export_traceback_file"] = None
+            row_count = int(payload.get("csv_rows_exported") or 0)
+            csv_path = payload.get("csv_file_path")
         else:
             csv_path = export_results_to_csv(
                 results,
@@ -1230,17 +1268,22 @@ def export_final_csv(
                 instance_id=INSTANCE_CONFIG.instance_id,
                 session_id=session_id,
             )
-        payload = {
-            "csv_file_path": str(csv_path),
-            "csv_export_status": "succeeded",
-            "csv_export_error": None,
-            "csv_export_traceback_file": None,
-            "csv_rows_exported": row_count,
-        }
-        summary["final CSV export path"] = str(csv_path)
-        summary["final CSV export status"] = "succeeded"
+            payload = {
+                "csv_file_path": str(csv_path),
+                "csv_downloads_path": None,
+                "csv_export_status": "succeeded",
+                "csv_export_error": None,
+                "csv_export_traceback_file": None,
+                "csv_rows_exported": row_count,
+                "csv_exported_at": datetime.now().isoformat(
+                    sep=" ",
+                    timespec="seconds",
+                ),
+            }
+        summary["final CSV export path"] = str(csv_path) if csv_path else None
+        summary["final CSV export status"] = payload.get("csv_export_status")
         summary["final CSV rows exported"] = row_count
-        if log_callback:
+        if log_callback and sqlite_run_id is None:
             log_callback(f"Final CSV exported atomically: {csv_path}")
     except Exception as exc:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1261,10 +1304,15 @@ def export_final_csv(
         )
         payload = {
             "csv_file_path": None,
+            "csv_downloads_path": None,
             "csv_export_status": "failed",
             "csv_export_error": str(exc),
             "csv_export_traceback_file": str(traceback_file.resolve()),
             "csv_rows_exported": row_count,
+            "csv_exported_at": datetime.now().isoformat(
+                sep=" ",
+                timespec="seconds",
+            ),
         }
         summary["final CSV export path"] = None
         summary["final CSV export status"] = "failed"
@@ -1407,8 +1455,9 @@ def render_instance_info() -> None:
     ]
     st.dataframe(text_rows_dataframe(info_rows), use_container_width=True, hide_index=True)
     st.warning(
-        "This 8 GB tower is limited to one scraper worker and one scraper browser. "
-        "A second scraper is refused by the host-wide safety lock."
+        "Each instance is limited to one scraper browser. The shared host "
+        "semaphore defaults to one active worker until the 32 GB hardware "
+        "preflight passes and concurrency is explicitly enabled."
     )
 
 
@@ -1654,7 +1703,9 @@ def collector_options_kwargs(config: CollectionConfig, stop_event: Event | None 
 def validate_collector_options(config: CollectionConfig, stop_event: Event | None = None) -> None:
     if config.batch_mode != "single" or int(config.max_parallel_workers) != 1:
         raise FatalScraperConfigError(
-            "Parallel or split batch workers are disabled on this 8 GB tower. Use Single run; it checkpoints every date."
+            "Parallel workers inside one instance are disabled. Use Single "
+            "run; it checkpoints every date. Separate instances are governed "
+            "by the configurable host semaphore."
         )
     try:
         CollectorOptions(**collector_options_kwargs(config, stop_event, attempt=1))
@@ -2062,12 +2113,20 @@ def run_collection_job(config: CollectionConfig, stop_event: Event, queue: Queue
         excel_path = export_results_to_excel(normalized_results, summary, EXPORT_DIR)
         options.stats["excel_export_time_seconds"] = round(time.perf_counter() - excel_start, 2)
         update_collection_run_excel_path(run_id, str(excel_path), backend=config.db_backend)
-        csv_payload = export_final_csv(normalized_results, summary, session_id=run_id, log_callback=log)
 
         status = terminal_status_for_results(normalized_results, stop_event.is_set(), None)
         if str(options.stats.get("completion_status") or "").startswith("incomplete") and normalized_results:
             status = "completed_with_partial_results"
         update_collection_run_status(run_id, status, backend=config.db_backend)
+        csv_payload = export_final_csv(
+            normalized_results,
+            summary,
+            session_id=run_id,
+            log_callback=log,
+            stream_sqlite_run_id=run_id
+            if config.db_backend == "sqlite"
+            else None,
+        )
         if checkpoint_payload is not None:
             checkpoint_payload["status"] = status
             checkpoint_payload["completed_dates"] = sorted(
@@ -2167,6 +2226,12 @@ def run_collection_job(config: CollectionConfig, stop_event: Event, queue: Queue
                 options.stats["resume_checkpoint_path"] = str(checkpoint_path.resolve())
         status = terminal_status_for_results(normalized_results, stop_event.is_set(), error_message)
         if run_id is not None:
+            update_collection_run_status(
+                run_id,
+                status,
+                error_message,
+                backend=config.db_backend,
+            )
             if normalized_results:
                 run_metadata = {
                     "source": config.source,
@@ -2183,9 +2248,16 @@ def run_collection_job(config: CollectionConfig, stop_event: Event, queue: Queue
                 summary = create_summary(normalized_results, run_metadata)
                 excel_path = export_results_to_excel(normalized_results, summary, EXPORT_DIR)
                 update_collection_run_excel_path(run_id, str(excel_path), backend=config.db_backend)
-                csv_payload = export_final_csv(normalized_results, summary, session_id=run_id, log_callback=log)
+                csv_payload = export_final_csv(
+                    normalized_results,
+                    summary,
+                    session_id=run_id,
+                    log_callback=log,
+                    stream_sqlite_run_id=run_id
+                    if config.db_backend == "sqlite"
+                    else None,
+                )
                 queue.put(("complete", {"results": normalized_results, "summary": summary, "excel_file_path": str(excel_path), "status": status, **csv_payload}))
-            update_collection_run_status(run_id, status, error_message, backend=config.db_backend)
             log(f"Database run status updated: {status}")
         queue.put(("failed", {"status": status, "error": error_message, **(locals().get("csv_payload") or {})}))
         progress(1.0, f"Collection finished: {status}")
@@ -3038,6 +3110,12 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
         else:
             final_excel_path = export_results_to_excel(normalized_results, summary, EXPORT_DIR)
         update_collection_run_excel_path(run_id, str(final_excel_path), backend=config.db_backend)
+        update_collection_run_status(
+            run_id,
+            status,
+            fatal_error,
+            backend=config.db_backend,
+        )
         csv_payload = export_final_csv(
             normalized_results,
             summary,
@@ -3045,7 +3123,6 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
             log_callback=log,
             stream_sqlite_run_id=run_id if config.db_backend == "sqlite" else None,
         )
-        update_collection_run_status(run_id, status, fatal_error, backend=config.db_backend)
         endurance_path = write_endurance_summary(status, fatal_error)
         checkpoint["status"] = status
         checkpoint.setdefault("output_files", {})["final_excel"] = str(final_excel_path)
@@ -3110,6 +3187,12 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
         log(f"Fatal job error after saving checkpoint/partials: {error_message}")
         csv_payload: dict[str, Any] = {}
         if run_id is not None:
+            update_collection_run_status(
+                run_id,
+                status,
+                error_message,
+                backend=config.db_backend,
+            )
             if normalized_results and status != "fatal_config_error":
                 summary = build_summary(status)
                 excel_path = None
@@ -3129,8 +3212,15 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
                 queue.put(("complete", {"results": normalized_results, "summary": summary, "excel_file_path": str(excel_path) if excel_path else None, "status": status, **csv_payload}))
             elif status != "fatal_config_error":
                 summary = build_summary(status)
-                csv_payload = export_final_csv([], summary, session_id=run_id, log_callback=log)
-            update_collection_run_status(run_id, status, error_message, backend=config.db_backend)
+                csv_payload = export_final_csv(
+                    [],
+                    summary,
+                    session_id=run_id,
+                    log_callback=log,
+                    stream_sqlite_run_id=run_id
+                    if config.db_backend == "sqlite"
+                    else None,
+                )
             write_endurance_summary(status, error_message)
         queue.put(("failed", {"status": status, "error": error_message, **csv_payload}))
         put_progress(queue, 1.0, f"Collection finished: {status}")
@@ -4082,7 +4172,11 @@ def main() -> None:
 
         planned_dates = date_range(checkin_start, checkin_end)
         st.header("Batch parallel collection")
-        st.info("This 8 GB tower is limited to one scraper worker and one scraper browser at a time.")
+        st.info(
+            "One scraper browser is allowed per instance. Host concurrency "
+            "remains limited to one until the 32 GB preflight is passed and "
+            "the upgrade is explicitly enabled."
+        )
         batch_label = st.selectbox(
             "Batch collection mode",
             ["Single run"],
@@ -4105,7 +4199,10 @@ def main() -> None:
             disabled=True,
         )
         max_parallel_workers = 1
-        st.warning("Parallel scraper workers are disabled by the host-wide safety lock.")
+        st.warning(
+            "Parallel workers inside this instance are disabled. Independent "
+            "instances use the shared host semaphore, whose safe default is one."
+        )
         resume_previous_run = st.checkbox("Resume interrupted run (explicit)", value=False)
         st.header("Reliability")
         retry_failed_dates_automatically = st.checkbox("Retry failed dates automatically", value=True)
@@ -4248,11 +4345,39 @@ def main() -> None:
                 st.warning("Enter the required search inputs before starting.")
             else:
                 st.warning("Start collection is disabled because database initialization failed.")
+        export_runs: list[dict[str, Any]] = []
+        if st.session_state.db_ready:
+            try:
+                export_runs = fetch_collection_runs(
+                    limit=100,
+                    backend=db_backend,
+                )
+            except Exception as exc:
+                st.warning(f"Could not load runs for Excel export: {exc}")
+        export_run_by_id = {
+            int(run["id"]): run
+            for run in export_runs
+            if run.get("id") is not None
+        }
+        selected_export_run_id = st.selectbox(
+            "Run ID to export to Excel",
+            options=list(export_run_by_id),
+            format_func=lambda value: (
+                f"Run {value} — {export_run_by_id[value].get('status')} — "
+                f"{export_run_by_id[value].get('checkin_date')} to "
+                f"{export_run_by_id[value].get('checkout_date')}"
+            ),
+            disabled=job_active or not export_run_by_id,
+        )
         start_clicked = st.button("Start collection", type="primary", use_container_width=True, disabled=not start_allowed or job_active)
         test_run_clicked = st.button("Start test run", use_container_width=True, disabled=not st.session_state.db_ready or job_active)
         stop_clicked = st.button("Stop collection", use_container_width=True, disabled=not job_active)
         refresh_clicked = st.button("Manual refresh", use_container_width=True)
-        export_clicked = st.button("Export latest results to Excel", use_container_width=True, disabled=job_active)
+        export_clicked = st.button(
+            "Export selected run to Excel",
+            use_container_width=True,
+            disabled=job_active or not export_run_by_id,
+        )
         merge_clicked = st.button("Merge instance exports", use_container_width=True, disabled=job_active)
         clear_clicked = st.button("Clear current dashboard results", use_container_width=True, disabled=job_active)
 
@@ -4354,33 +4479,80 @@ def main() -> None:
             st.error(f"Collection did not start. {preflight['first_failed_check']}")
 
     if export_clicked:
-        results = st.session_state.results
-        if not results and st.session_state.db_ready:
-            try:
-                results = fetch_latest_results(backend=db_backend)
-            except Exception as exc:
-                st.warning(f"Could not load latest database results: {exc}")
-                results = []
-        if results:
-            run_metadata = {
-                "source": results[0].get("source"),
-                "city_or_region": results[0].get("city_or_region"),
-                "checkin_date": results[0].get("checkin_date"),
-                "checkout_date": results[0].get("checkout_date"),
-                "number_of_nights": results[0].get("number_of_nights"),
-                "adults": results[0].get("adults"),
-                "currency": results[0].get("currency"),
-                "started_at": None,
-                "completed_at": datetime.now(),
+        try:
+            run_id = int(selected_export_run_id)
+            run_metadata = fetch_collection_run_by_id(
+                run_id,
+                backend=db_backend,
+            )
+            if run_metadata is None:
+                raise ValueError(f"Run {run_id} no longer exists")
+            row_count = count_results_by_run_id(
+                run_id,
+                backend=db_backend,
+            )
+            if row_count <= 0:
+                raise ValueError(f"Run {run_id} has no hotel rows to export")
+            run_start = date.fromisoformat(str(run_metadata["checkin_date"]))
+            checkout_boundary = date.fromisoformat(
+                str(run_metadata["checkout_date"])
+            )
+            run_end = checkout_boundary - timedelta(
+                days=max(1, int(run_metadata.get("number_of_nights") or 1))
+            )
+            summary = {
+                "run ID": run_id,
+                "instance ID": INSTANCE_CONFIG.instance_id,
+                "run status": run_metadata.get("status"),
+                "source": run_metadata.get("source"),
+                "city_or_region": run_metadata.get("city_or_region"),
+                "checkin_date": run_start,
+                "checkout_date": checkout_boundary,
+                "planned end date": run_end,
+                "number_of_nights": run_metadata.get("number_of_nights"),
+                "adults": run_metadata.get("adults"),
+                "currency": run_metadata.get("currency"),
+                "collection started at": run_metadata.get("started_at"),
+                "collection completed at": run_metadata.get("completed_at"),
+                "rows exported": row_count,
             }
-            summary = create_summary(results, run_metadata)
-            excel_path = export_results_to_excel(results, summary, EXPORT_DIR)
+            filename = next_available_run_excel_filename(
+                EXPORT_DIR,
+                str(run_metadata.get("source") or "source"),
+                str(run_metadata.get("city_or_region") or "city"),
+                INSTANCE_CONFIG.instance_id,
+                run_id,
+                run_start,
+                run_end,
+            )
+            if db_backend == "sqlite":
+                excel_path = export_sqlite_run_to_excel(
+                    run_id,
+                    summary,
+                    EXPORT_DIR,
+                    filename=filename,
+                    overwrite_existing=False,
+                )
+            else:
+                all_results = fetch_results_by_run_id(
+                    run_id,
+                    backend=db_backend,
+                )
+                excel_path = export_results_to_excel(
+                    all_results,
+                    summary,
+                    EXPORT_DIR,
+                    filename=filename,
+                    overwrite_existing=False,
+                )
             st.session_state.excel_file_path = str(excel_path)
             st.session_state.summary = summary
-            st.session_state.results = results
-            st.success(f"Exported latest results to {excel_path}")
-        else:
-            st.warning("No results are available to export.")
+            st.success(
+                f"Exported all {row_count:,} database rows for run {run_id} "
+                f"to {excel_path}"
+            )
+        except Exception as exc:
+            st.error(f"Could not export the selected run: {exc}")
 
     if merge_clicked:
         try:

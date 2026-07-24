@@ -1,0 +1,11 @@
+# Safe default for the current 8 GB machine.
+OTA_MAX_CONCURRENT_WORKERS=1
+OTA_AUTO_EXPORT_ENABLED=1
+OTA_AUTO_EXPORT_DOWNLOADS=1
+OTA_DOWNLOADS_DIR=/home/jf/Downloads
+
+# Change this to 3 only after:
+#   .venv/bin/python tools/ota_scheduler.py prepare
+#   .venv/bin/python tools/ota_scheduler.py preflight
+#   .venv/bin/python tools/ota_scheduler.py enable-concurrency
+# The enable command refuses machines with less than 28 GB usable RAM.

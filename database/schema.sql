@@ -14,7 +14,13 @@ create table if not exists collection_runs (
     error_message text null,
     excel_file_path text null,
     selected_star_ratings text null,
-    include_unknown_star_rating boolean null
+    include_unknown_star_rating boolean null,
+    csv_export_status text null,
+    csv_file_path text null,
+    csv_downloads_path text null,
+    csv_rows_exported bigint null,
+    csv_exported_at timestamp null,
+    csv_export_error text null
 );
 
 alter table collection_runs
@@ -22,6 +28,24 @@ alter table collection_runs
 
 alter table collection_runs
     add column if not exists include_unknown_star_rating boolean;
+
+alter table collection_runs
+    add column if not exists csv_export_status text;
+
+alter table collection_runs
+    add column if not exists csv_file_path text;
+
+alter table collection_runs
+    add column if not exists csv_downloads_path text;
+
+alter table collection_runs
+    add column if not exists csv_rows_exported bigint;
+
+alter table collection_runs
+    add column if not exists csv_exported_at timestamp;
+
+alter table collection_runs
+    add column if not exists csv_export_error text;
 
 create table if not exists hotel_price_results (
     id bigserial primary key,

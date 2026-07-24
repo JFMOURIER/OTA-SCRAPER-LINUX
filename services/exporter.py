@@ -4,7 +4,7 @@ import csv
 import re
 import os
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -20,11 +20,16 @@ from services.normalizer import RESULT_FIELDS
 CSV_EXPORT_COLUMNS = [
     "source_website",
     "hotel_name",
+    "ota_hotel_id",
     "star_rating",
     "review_score",
     "number_of_reviews",
+    "raw_price",
+    "parsed_price",
     "cheapest_visible_price",
     "currency",
+    "adults",
+    "room_type",
     "hotel_url",
     "destination_city",
     "checkin_date",
@@ -38,8 +43,34 @@ CSV_EXPORT_COLUMNS = [
     "hotel_filter_reason",
     "timestamp",
     "scrape_session_id",
+    "collection_run_id",
     "instance_id",
     "error_message",
+] + [
+    field
+    for field in RESULT_FIELDS
+    if field
+    not in {
+        "collection_run_id",
+        "hotel_name",
+        "ota_hotel_id",
+        "star_rating",
+        "review_score",
+        "parsed_price",
+        "currency",
+        "adults",
+        "hotel_url",
+        "checkin_date",
+        "checkout_date",
+        "requested_checkin_date",
+        "requested_checkout_date",
+        "effective_checkin_date",
+        "effective_checkout_date",
+        "date_integrity_verified",
+        "property_type",
+        "hotel_filter_reason",
+        "error_message",
+    }
 ]
 
 
@@ -74,6 +105,71 @@ def build_csv_filename(source: str, city_or_region: str, instance_id: str, expor
     city_part = safe_filename(str(city_or_region or "city").lower())
     instance_part = safe_filename(str(instance_id or "default").lower())
     return f"ota_results_{source_part}_{city_part}_{instance_part}_{timestamp}.csv"
+
+
+def build_run_excel_filename(
+    source: str,
+    city_or_region: str,
+    instance_id: str,
+    run_id: int,
+    start_date: Any,
+    end_date: Any,
+    exported_at: datetime | None = None,
+) -> str:
+    timestamp = (exported_at or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    source_part = safe_filename(str(source or "source").lower().replace(".com", ""))
+    city_part = safe_filename(str(city_or_region or "city").lower())
+    instance_part = safe_filename(str(instance_id or "default").lower())
+    return (
+        f"ota_results_{source_part}_{city_part}_{instance_part}_run_{int(run_id)}_"
+        f"{start_date}_to_{end_date}_{timestamp}.xlsx"
+    )
+
+
+def next_available_run_excel_filename(
+    output_dir: str | Path,
+    source: str,
+    city_or_region: str,
+    instance_id: str,
+    run_id: int,
+    start_date: Any,
+    end_date: Any,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Allocate a timestamped manual export name without replacing a file."""
+
+    candidate_time = now or datetime.now()
+    output_path = Path(output_dir)
+    for offset in range(120):
+        filename = build_run_excel_filename(
+            source,
+            city_or_region,
+            instance_id,
+            run_id,
+            start_date,
+            end_date,
+            candidate_time + timedelta(seconds=offset),
+        )
+        if not (output_path / filename).exists():
+            return filename
+    raise FileExistsError(
+        "Could not allocate a unique timestamped Excel filename"
+    )
+
+
+def _publish_atomic_no_overwrite(tmp_path: Path, final_path: Path) -> Path:
+    """Atomically publish a same-directory temp file without replacement."""
+
+    if final_path.exists():
+        raise FileExistsError(f"Refusing to overwrite existing export: {final_path}")
+    try:
+        os.link(tmp_path, final_path)
+    except FileExistsError:
+        raise
+    else:
+        tmp_path.unlink()
+    return final_path
 
 
 def _numeric_values(results: list[dict[str, Any]], field: str) -> list[float]:
@@ -225,14 +321,27 @@ def _summary_or_first_row(summary: dict[str, Any], results: list[dict[str, Any]]
 
 
 def _result_csv_row(row: dict[str, Any], *, session_id: Any, instance_id: str, exported_at: datetime) -> dict[str, Any]:
-    return {
+    payload = {
+        field: _serialize_for_csv(row.get(field))
+        for field in RESULT_FIELDS
+    }
+    payload.update({
         "source_website": _serialize_for_csv(row.get("source")),
         "hotel_name": _serialize_for_csv(row.get("hotel_name")),
+        "ota_hotel_id": _serialize_for_csv(row.get("ota_hotel_id")),
         "star_rating": _serialize_for_csv(row.get("star_rating")),
         "review_score": _serialize_for_csv(row.get("review_score")),
         "number_of_reviews": _serialize_for_csv(row.get("review_count")),
+        "raw_price": _serialize_for_csv(row.get("raw_price_text")),
+        "parsed_price": _serialize_for_csv(
+            _first_present(row, "parsed_price", "cheapest_price_total")
+        ),
         "cheapest_visible_price": _serialize_for_csv(_first_present(row, "cheapest_price_total", "parsed_price", "raw_price_text")),
         "currency": _serialize_for_csv(row.get("currency")),
+        "adults": _serialize_for_csv(row.get("adults")),
+        "room_type": _serialize_for_csv(
+            _first_present(row, "room_name", "cheapest_room_name")
+        ),
         "hotel_url": _serialize_for_csv(row.get("hotel_url")),
         "destination_city": _serialize_for_csv(row.get("city_or_region")),
         "checkin_date": _serialize_for_csv(row.get("checkin_date")),
@@ -246,9 +355,13 @@ def _result_csv_row(row: dict[str, Any], *, session_id: Any, instance_id: str, e
         "hotel_filter_reason": _serialize_for_csv(row.get("hotel_filter_reason")),
         "timestamp": _serialize_for_csv(row.get("collected_at") or exported_at),
         "scrape_session_id": _serialize_for_csv(session_id or row.get("collection_run_id")),
+        "collection_run_id": _serialize_for_csv(
+            row.get("collection_run_id") or session_id
+        ),
         "instance_id": _serialize_for_csv(instance_id),
         "error_message": _serialize_for_csv(row.get("error_message")),
-    }
+    })
+    return payload
 
 
 def export_results_to_csv(
@@ -270,14 +383,16 @@ def export_results_to_csv(
     csv_path = output_path / (filename or build_csv_filename(str(source), str(city), str(resolved_instance_id), exported_at))
 
     tmp_path = csv_path.with_name(f".{csv_path.name}.{os.getpid()}.{uuid4().hex}.tmp")
-    with tmp_path.open("w", encoding="utf-8", newline="") as handle:
+    if csv_path.exists():
+        raise FileExistsError(f"Refusing to overwrite existing export: {csv_path}")
+    with tmp_path.open("x", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=CSV_EXPORT_COLUMNS)
         writer.writeheader()
         for row in results:
             writer.writerow(_result_csv_row(row, session_id=resolved_session_id, instance_id=str(resolved_instance_id), exported_at=exported_at))
         handle.flush()
         os.fsync(handle.fileno())
-    tmp_path.replace(csv_path)
+    _publish_atomic_no_overwrite(tmp_path, csv_path)
     return csv_path.resolve()
 
 
@@ -364,7 +479,14 @@ def build_master_excel_filename(source: str, city_or_region: str, start_date: An
     return f"{source_part}_{city_part}_FULL_{start_date}_to_{end_date}_{timestamp}.xlsx"
 
 
-def export_results_to_excel(results: list[dict[str, Any]], summary: dict[str, Any], output_dir: str | Path, filename: str | None = None) -> Path:
+def export_results_to_excel(
+    results: list[dict[str, Any]],
+    summary: dict[str, Any],
+    output_dir: str | Path,
+    filename: str | None = None,
+    *,
+    overwrite_existing: bool = True,
+) -> Path:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -376,6 +498,8 @@ def export_results_to_excel(results: list[dict[str, Any]], summary: dict[str, An
     )
     file_path = output_path / filename
     tmp_path = file_path.with_name(f".{file_path.stem}.{os.getpid()}.{uuid4().hex}.tmp{file_path.suffix}")
+    if file_path.exists() and not overwrite_existing:
+        raise FileExistsError(f"Refusing to overwrite existing export: {file_path}")
 
     results_df = _results_dataframe(results)
     date_status_rows = summary.get("__date_status_rows") if isinstance(summary.get("__date_status_rows"), list) else []
@@ -438,7 +562,10 @@ def export_results_to_excel(results: list[dict[str, Any]], summary: dict[str, An
         summary_sheet.set_column(0, 0, 32)
         summary_sheet.set_column(1, 1, 48)
 
-    tmp_path.replace(file_path)
+    if overwrite_existing:
+        os.replace(tmp_path, file_path)
+    else:
+        _publish_atomic_no_overwrite(tmp_path, file_path)
     return file_path.resolve()
 
 
@@ -506,7 +633,7 @@ def export_batch_master_excel(
                     fmt = date_format
                 sheet.set_column(idx, idx, width, fmt)
 
-    tmp_path.replace(file_path)
+    os.replace(tmp_path, file_path)
     return file_path.resolve()
 
 
@@ -524,6 +651,7 @@ def export_sqlite_run_to_excel(
     filename: str | None = None,
     *,
     batch_size: int = 500,
+    overwrite_existing: bool = True,
 ) -> Path:
     """Export a run with bounded memory and an atomic final rename."""
 
@@ -539,6 +667,8 @@ def export_sqlite_run_to_excel(
     )
     file_path = output_path / filename
     tmp_path = file_path.with_name(f".{file_path.stem}.{os.getpid()}.{uuid4().hex}.tmp{file_path.suffix}")
+    if file_path.exists() and not overwrite_existing:
+        raise FileExistsError(f"Refusing to overwrite existing export: {file_path}")
     columns = list(RESULT_FIELDS)
     raw_columns = ["source", "provider_name", "hotel_name", "checkin_date", "raw_source_payload", "error_message"]
     by_date: dict[tuple[str, str], dict[str, Any]] = {}
@@ -638,7 +768,10 @@ def export_sqlite_run_to_excel(
         raise
     else:
         workbook.close()
-    tmp_path.replace(file_path)
+    if overwrite_existing:
+        os.replace(tmp_path, file_path)
+    else:
+        _publish_atomic_no_overwrite(tmp_path, file_path)
     return file_path.resolve()
 
 
@@ -651,7 +784,7 @@ def export_sqlite_run_to_csv(
     instance_id: str = "default",
     batch_size: int = 500,
 ) -> Path:
-    from database.db import iter_sqlite_results_by_run_id
+    from database.db import count_results_by_run_id, iter_sqlite_results_by_run_id
 
     exported_at = datetime.now()
     output_path = Path(output_dir)
@@ -664,14 +797,25 @@ def export_sqlite_run_to_csv(
     )
     csv_path = output_path / filename
     tmp_path = csv_path.with_name(f".{csv_path.name}.{os.getpid()}.{uuid4().hex}.tmp")
-    with tmp_path.open("w", encoding="utf-8", newline="") as handle:
+    if csv_path.exists():
+        raise FileExistsError(f"Refusing to overwrite existing export: {csv_path}")
+    written_rows = 0
+    with tmp_path.open("x", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=CSV_EXPORT_COLUMNS)
         writer.writeheader()
         for batch in iter_sqlite_results_by_run_id(run_id, batch_size=batch_size):
             for row in batch:
                 writer.writerow(_result_csv_row(row, session_id=run_id, instance_id=instance_id, exported_at=exported_at))
+                written_rows += 1
             del batch
         handle.flush()
         os.fsync(handle.fileno())
-    tmp_path.replace(csv_path)
+    expected_rows = count_results_by_run_id(run_id, backend="sqlite")
+    if written_rows != expected_rows:
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"CSV rows written ({written_rows}) do not match SQLite run "
+            f"{run_id} rows ({expected_rows})"
+        )
+    _publish_atomic_no_overwrite(tmp_path, csv_path)
     return csv_path.resolve()

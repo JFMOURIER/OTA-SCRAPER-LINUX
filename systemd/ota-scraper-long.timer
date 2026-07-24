@@ -1,0 +1,11 @@
+[Unit]
+Description=Run long-window OTA scraper daily at 01:35
+
+[Timer]
+OnCalendar=*-*-* 01:35:00
+AccuracySec=1min
+Persistent=false
+Unit=ota-scraper-long.service
+
+[Install]
+WantedBy=timers.target

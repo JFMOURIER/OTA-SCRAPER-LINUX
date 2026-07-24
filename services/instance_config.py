@@ -48,6 +48,8 @@ class InstanceConfig:
     end_date: date | None
     city: str
     source: str
+    display: str | None
+    date_bucket: str | None
     active: bool
 
     @property
@@ -75,6 +77,10 @@ class InstanceConfig:
         return self.data_dir / "browser_profile" if self.active else BASE_DIR / "data" / "browser_profile"
 
     @property
+    def browser_run_profile_root(self) -> Path:
+        return self.browser_profile_dir / "runs"
+
+    @property
     def checkpoint_dir(self) -> Path:
         return self.data_dir / "checkpoints" if self.active else BASE_DIR / "data" / "checkpoints"
 
@@ -90,9 +96,25 @@ class InstanceConfig:
     def status_file(self) -> Path:
         return self.status_dir / "current_job_status.json"
 
+    @property
+    def heartbeat_file(self) -> Path:
+        return self.status_dir / "heartbeat.json"
+
+    @property
+    def pid_file(self) -> Path:
+        return self.status_dir / "scheduled_run.pid"
+
+    @property
+    def lock_file(self) -> Path:
+        return self.status_dir / "active_scraper.lock"
+
+    @property
+    def scheduled_lock_file(self) -> Path:
+        return self.status_dir / "scheduled_run.lock"
+
     def ensure_directories(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        for path in [self.export_dir, self.screenshot_dir, self.debug_dir, self.log_dir, self.browser_profile_dir, self.checkpoint_dir, self.partial_dir, self.status_dir]:
+        for path in [self.export_dir, self.screenshot_dir, self.debug_dir, self.log_dir, self.browser_profile_dir, self.browser_run_profile_root, self.checkpoint_dir, self.partial_dir, self.status_dir]:
             path.mkdir(parents=True, exist_ok=True)
 
 
@@ -118,6 +140,8 @@ def load_instance_config(default_start: date | None = None, default_end: date | 
         end_date=end_date,
         city=_env_text("INSTANCE_CITY", "Orlando"),
         source=_env_text("INSTANCE_SOURCE", "Booking.com"),
+        display=os.getenv("DISPLAY") or None,
+        date_bucket=os.getenv("INSTANCE_DATE_BUCKET") or None,
         active=active,
     )
 
