@@ -95,7 +95,14 @@ class WorkerSupervisor:
             request = validate_request(raw, self.instance_id)
             action = request["action"]
             if action == "stop":
-                self.request_child_stop(request_id, "user")
+                self.request_child_stop(
+                    request_id,
+                    "user",
+                    stop_source=str(request.get("stop_source") or "unknown"),
+                    stop_requested_at=str(
+                        request.get("timestamp") or now_text()
+                    ),
+                )
             elif action in {"start", "resume"}:
                 if self.child and self.child.poll() is None:
                     raise RuntimeError("this instance already has an active scraper child")
@@ -132,7 +139,14 @@ class WorkerSupervisor:
             )
             self.log(f"Request {request_id or '<missing>'} rejected: {exc}")
 
-    def request_child_stop(self, request_id: str, reason: str) -> None:
+    def request_child_stop(
+        self,
+        request_id: str,
+        reason: str,
+        *,
+        stop_source: str | None = None,
+        stop_requested_at: str | None = None,
+    ) -> None:
         active = read_json(self.paths.active_job)
         job_id = str(active.get("job_id") or read_json(self.paths.status).get("active_job_id") or "")
         atomic_write_json(
@@ -141,6 +155,8 @@ class WorkerSupervisor:
                 "job_id": job_id,
                 "cancel_requested": True,
                 "reason": reason,
+                "stop_source": stop_source,
+                "stop_requested_at": stop_requested_at or now_text(),
                 "updated_at": now_text(),
             },
         )
@@ -241,11 +257,10 @@ class WorkerSupervisor:
         try:
             self.child.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-                self.log(f"SIGKILL sent to scraper PGID {pgid} after grace timeout.")
-            except (ProcessLookupError, PermissionError):
-                pass
+            self.log(
+                f"Scraper PGID {pgid} is still exiting after SIGTERM; "
+                "no unrelated or broad process signal was used."
+            )
 
     def heartbeat_stale(self) -> bool:
         heartbeat = read_json(self.paths.heartbeat)
@@ -327,6 +342,12 @@ class WorkerSupervisor:
         if self.stop_requested or (
             job_status.startswith("stopped_by_user") and not supervisor_recovery
         ):
+            from services.stop_control import finalize_stopped_run
+
+            finalize_stopped_run(
+                self.instance_id,
+                data_dir=self.data_dir,
+            )
             active["state"] = "stopped_by_user"
             atomic_write_json(self.paths.active_job, active)
             write_status(self.paths, status="stopped_by_user", scraper_child_pid=None, scraper_child_pgid=None)

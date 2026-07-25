@@ -2,21 +2,21 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date, datetime, time
+from datetime import date, time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 import streamlit as st
 
-from services.drive_delivery import (
+from services.google_drive_sync import (
     drive_configuration_status,
     load_drive_state,
+    pending_upload_states,
     retry_latest_failed_upload,
     test_drive_folder_access,
 )
 from services.hardware_preflight import three_worker_concurrency_enabled
-from services.job_runner import atomic_write_json
 from services.schedule_config import (
     DATE_MODE_AUTOMATIC,
     DATE_MODE_MANUAL,
@@ -24,6 +24,7 @@ from services.schedule_config import (
     default_daily_times,
     disable_schedule,
     frequency_description,
+    interval_seconds_for_runs_per_day,
     load_schedule,
     next_scheduled_run,
     paris_now,
@@ -90,29 +91,11 @@ def _time_value(value: str) -> time:
     return time.fromisoformat(value)
 
 
-def _stop_current_worker(instance_id: str, data_dir: Path) -> dict[str, Any]:
-    status = _read_json(data_dir / "status" / "current_job_status.json")
-    job_id = status.get("job_id")
-    if not job_id or status.get("status") not in {
-        "starting",
-        "running",
-        "stopping",
-    }:
-        return {"status": "idle", "message": "No active worker was found."}
-    payload = {
-        "job_id": str(job_id),
-        "cancel_requested": True,
-        "reason": "schedule_ui",
-        "updated_at": datetime.now().isoformat(
-            sep=" ",
-            timespec="seconds",
-        ),
-    }
-    atomic_write_json(data_dir / "status" / "cancel_request.json", payload)
-    return {"status": "stop_requested", "job_id": str(job_id)}
-
-
-def render_automatic_schedule(instance_config: Any) -> None:
+def render_automatic_schedule(
+    instance_config: Any,
+    *,
+    stop_callback: Callable[[str], dict[str, Any]] | None = None,
+) -> None:
     instance_id = str(instance_config.instance_id)
     if instance_id not in SCHEDULED_INSTANCES:
         return
@@ -133,6 +116,9 @@ def render_automatic_schedule(instance_config: Any) -> None:
         folder_id=definition.drive_folder_id,
     )
     latest_drive = _latest_drive_state(data_dir)
+    pending_drive_count = len(
+        pending_upload_states(instance_id, data_dir=data_dir)
+    )
     worker_status = _read_json(
         data_dir / "status" / "current_job_status.json"
     )
@@ -140,7 +126,7 @@ def render_automatic_schedule(instance_config: Any) -> None:
         3 if three_worker_concurrency_enabled() else 1
     )
 
-    st.header("Automatic Schedule")
+    st.header("Scheduler")
     st.caption(
         "The dispatcher runs independently of Streamlit. Opening or refreshing "
         "this page never starts a collection."
@@ -187,29 +173,51 @@ def render_automatic_schedule(instance_config: Any) -> None:
     template = dict(schedule["collection_template"])
     with st.form(form_key):
         enabled = st.toggle(
-            "Schedule enabled",
+            "On / Off",
             value=bool(schedule["enabled"]),
-        )
-        date_label = st.radio(
-            "Date mode",
-            ["Automatic rolling dates", "Manual fixed dates"],
-            index=(
-                0
-                if schedule["date_mode"] == DATE_MODE_AUTOMATIC
-                else 1
-            ),
-            horizontal=True,
-        )
-        date_mode = (
-            DATE_MODE_AUTOMATIC
-            if date_label == "Automatic rolling dates"
-            else DATE_MODE_MANUAL
         )
         manual_start = date.fromisoformat(schedule["manual_start_date"])
         manual_end = date.fromisoformat(schedule["manual_end_date"])
         over_year_confirmed = bool(
             schedule["manual_over_one_year_confirmed"]
         )
+        rolling_dates_locked = (
+            instance_id == "near_30_days" and bool(schedule["enabled"])
+        )
+        if rolling_dates_locked:
+            date_mode = DATE_MODE_AUTOMATIC
+            locked_dates = st.columns(2)
+            locked_dates[0].date_input(
+                "Start date",
+                value=automatic_start,
+                disabled=True,
+            )
+            locked_dates[1].date_input(
+                "End date",
+                value=automatic_end,
+                disabled=True,
+            )
+            st.caption(
+                "Dates are controlled by the rolling scheduler: Europe/Paris "
+                "today through today + 30 calendar days. They are recalculated "
+                "at the beginning of every cycle."
+            )
+        else:
+            date_label = st.radio(
+                "Date mode",
+                ["Automatic rolling dates", "Manual fixed dates"],
+                index=(
+                    0
+                    if schedule["date_mode"] == DATE_MODE_AUTOMATIC
+                    else 1
+                ),
+                horizontal=False,
+            )
+            date_mode = (
+                DATE_MODE_AUTOMATIC
+                if date_label == "Automatic rolling dates"
+                else DATE_MODE_MANUAL
+            )
         if date_mode == DATE_MODE_MANUAL:
             manual_columns = st.columns(2)
             manual_start = manual_columns[0].date_input(
@@ -233,20 +241,34 @@ def render_automatic_schedule(instance_config: Any) -> None:
                     value=over_year_confirmed,
                 )
         if instance_id == "near_30_days":
-            interval_minutes = int(
-                st.number_input(
-                    "Run every N minutes",
-                    min_value=15,
-                    max_value=1440,
-                    value=int(schedule["interval_minutes"] or 60),
-                    step=1,
+            runs_per_day = int(
+                st.selectbox(
+                    "Runs per day",
+                    list(range(1, 25)),
+                    index=max(0, int(schedule["runs_per_day"] or 24) - 1),
+                    format_func=lambda value: (
+                        f"{value} run per day"
+                        if value == 1
+                        else f"{value} runs per day"
+                    ),
                 )
             )
-            hours, minutes = divmod(interval_minutes, 60)
+            interval_seconds = interval_seconds_for_runs_per_day(runs_per_day)
+            if interval_seconds.is_integer() and int(interval_seconds) % 3600 == 0:
+                interval_text = (
+                    f"{int(interval_seconds) // 3600} hour(s)"
+                )
+            elif interval_seconds.is_integer() and int(interval_seconds) % 60 == 0:
+                interval_text = (
+                    f"{int(interval_seconds) // 60} minute(s)"
+                )
+            else:
+                interval_text = f"{interval_seconds:.3f} seconds"
             st.caption(
-                f"Equivalent interval: {hours} hour(s), {minutes} minute(s)"
+                f"{runs_per_day} run(s)/day = every {interval_text} over a "
+                "rolling 24-hour period."
             )
-            runs_per_day = None
+            interval_minutes = interval_seconds / 60.0
             daily_run_times: list[str] = []
         else:
             maximum = 4 if instance_id == "medium_31_120_days" else 2
@@ -451,7 +473,11 @@ def render_automatic_schedule(instance_config: Any) -> None:
         candidate = {
             **schedule,
             "enabled": enabled,
-            "date_mode": date_mode,
+            "date_mode": (
+                DATE_MODE_AUTOMATIC
+                if instance_id == "near_30_days" and enabled
+                else date_mode
+            ),
             "manual_start_date": manual_start.isoformat(),
             "manual_end_date": manual_end.isoformat(),
             "manual_over_one_year_confirmed": over_year_confirmed,
@@ -589,16 +615,24 @@ def render_automatic_schedule(instance_config: Any) -> None:
             st.warning(result)
 
     if st.button(
-        "Request Stop Current Worker",
+        "Stop",
         key=f"stop_scheduled_worker_{instance_id}",
+        use_container_width=True,
     ):
-        result = _stop_current_worker(instance_id, data_dir)
-        if result["status"] == "stop_requested":
-            st.warning(
-                "Graceful stop requested. The worker will checkpoint before exit."
-            )
+        if stop_callback is not None:
+            result = stop_callback("sidebar")
         else:
-            st.info(result["message"])
+            from services.stop_control import request_instance_stop
+
+            result = request_instance_stop(
+                instance_id,
+                data_dir=data_dir,
+                source="sidebar",
+            )
+        if result["status"] == "stop_requested":
+            st.warning("Stop requested…")
+        else:
+            st.info("Scheduler is off; no active worker was detected.")
 
     schedule = load_schedule(instance_id, data_dir=data_dir)
     state = read_schedule_state(instance_id, data_dir=data_dir)
@@ -633,6 +667,37 @@ def render_automatic_schedule(instance_config: Any) -> None:
         {
             "Item": "Google Drive configuration state",
             "Value": drive_status["status"],
+        },
+        {
+            "Item": "Drive configured",
+            "Value": drive_status["status"] == "configured",
+        },
+        {
+            "Item": "Target folder",
+            "Value": definition.drive_folder_id,
+        },
+        {
+            "Item": "Last successful upload",
+            "Value": latest_drive.get("drive_uploaded_at"),
+        },
+        {
+            "Item": "Last uploaded filename",
+            "Value": latest_drive.get("google_drive_remote_filename"),
+        },
+        {
+            "Item": "Local / remote size",
+            "Value": (
+                f"{latest_drive.get('local_csv_bytes')} / "
+                f"{latest_drive.get('google_drive_remote_bytes')}"
+            ),
+        },
+        {
+            "Item": "Pending upload count",
+            "Value": pending_drive_count,
+        },
+        {
+            "Item": "Last Drive error",
+            "Value": latest_drive.get("drive_upload_error"),
         },
         {
             "Item": "Last upload status",

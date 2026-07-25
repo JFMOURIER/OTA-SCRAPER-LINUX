@@ -273,8 +273,8 @@ migrated or merged.
 The shared Europe/Paris rolling-date resolver calculates all windows from one
 anchor immediately before a run:
 
-- 8501: `anchor` through `anchor + 1 calendar month - 1 day`.
-- 8502: `anchor + 1 calendar month` through
+- 8501: `anchor` through exactly `anchor + 30 calendar days`.
+- 8502: the first day after the 8501 window through
   `anchor + 4 calendar months - 1 day`.
 - 8503: `anchor + 4 calendar months` through the earlier of
   `anchor + 12 calendar months - 1 day` and `anchor + 365 days`.
@@ -294,14 +294,20 @@ scraper.
 
 Frequency controls are independent:
 
-- 8501 accepts an integer from 15 through 1440 minutes and defaults to 60.
-  Interval boundaries are based on scheduled start times, not page refresh or
-  completion times.
+- 8501 accepts every integer from 1 through 24 runs per rolling 24 hours.
+  The exact interval is `86400 / runs_per_day` seconds and defaults to 24
+  runs/day. Interval boundaries are based on scheduled start times, not page
+  refresh or completion times.
 - 8502 accepts 1–4 runs/day and defaults to 2 at `00:20` and `12:20`.
   Defaults for 1, 3, and 4 are `00:20`; `00:20, 08:20, 16:20`; and
   `00:20, 06:20, 12:20, 18:20`.
 - 8503 accepts 1–2 runs/day and defaults to 1 at `01:35`; the two-run default is
   `01:35, 13:35`.
+
+The complete scheduler and Drive status panels live in the left sidebar. Both
+the top-page and sidebar Stop buttons call the same durable per-instance stop
+controller. A stop disables that instance's scheduler, requests cooperative
+shutdown, and preserves committed rows in an explicit-run partial CSV.
 
 Daily times are editable but must be valid, unique, and sorted. All schedules
 start disabled. Use **Save Schedule**, then enable explicitly. **Disable
@@ -346,7 +352,7 @@ Every daily slot key contains its local scheduled date/time; every interval
 slot key contains its interval boundary. Dispatched keys persist, so a
 dispatcher restart cannot launch a slot twice. Only one pending due slot per
 instance is retained. If the same instance is already active, the event is
-`scheduled_run_skipped_previous_run_active`. If another instance holds the
+`skipped_active_run`. If another instance holds the
 shared host slot, it is `scheduled_run_deferred_host_capacity` and is retried
 on later ticks until its grace period expires. This capacity condition does not
 mark the collection failed.

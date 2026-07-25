@@ -101,7 +101,7 @@ def job_is_terminal(status: str | None) -> bool:
         "stopped_by_user_with_partial_results",
         "fatal_config_error",
         "failed_restart_limit",
-        "scheduled_run_skipped_previous_run_active",
+        "skipped_active_run",
         "scheduled_run_skipped_host_concurrency_limit",
         "concurrency_upgrade_not_ready",
     }

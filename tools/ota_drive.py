@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from services.drive_delivery import (
+from services.google_drive_sync import (
     drive_configuration_status,
     pending_upload_states,
     retry_latest_failed_upload,

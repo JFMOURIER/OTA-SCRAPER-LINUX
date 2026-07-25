@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from services.schedule_dispatcher import dispatch_once
-from services.drive_delivery import (
+from services.google_drive_sync import (
     drive_configuration_status,
     pending_upload_states,
 )

@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -65,7 +66,40 @@ def _rclone_binary() -> str | None:
     override = os.getenv("OTA_RCLONE_BIN")
     if override:
         return override
-    return shutil.which("rclone")
+    located = shutil.which("rclone")
+    if located:
+        return located
+    user_local = Path.home() / ".local" / "bin" / "rclone"
+    if user_local.is_file() and os.access(user_local, os.X_OK):
+        return str(user_local)
+    return None
+
+
+def drive_queue_data_dirs(instance_id: str) -> list[Path]:
+    """Return current and legacy isolated queue roots for one logical instance."""
+
+    definition = get_scheduled_instance(instance_id)
+    aliases = {
+        "near_30_days": ("instance_1", "period_1"),
+        "medium_31_120_days": ("instance_2", "period_2"),
+        "long_121_365_days": ("instance_3", "period_3"),
+    }[definition.instance_id]
+    candidates = [
+        definition.data_dir,
+        *(
+            definition.data_dir.parent / alias
+            for alias in aliases
+        ),
+    ]
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen or not resolved.is_dir():
+            continue
+        seen.add(resolved)
+        unique.append(resolved)
+    return unique
 
 
 def _base_command() -> list[str]:
@@ -172,6 +206,24 @@ def _save_drive_state(
     except Exception:
         # Local state is authoritative for delivery retries.  A collection DB
         # metadata failure must not discard a successful or retryable upload.
+        pass
+    try:
+        from services.operational_status import update_operational_status
+
+        update_operational_status(
+            str(state.get("instance_id")),
+            data_dir=data_dir,
+            google_drive_upload_status=state.get("drive_upload_status"),
+            google_drive_folder_id=state.get("drive_folder_id"),
+            google_drive_remote_filename=state.get(
+                "google_drive_remote_filename"
+            ),
+            google_drive_remote_bytes=state.get(
+                "google_drive_remote_bytes"
+            ),
+            google_drive_upload_error=state.get("drive_upload_error"),
+        )
+    except Exception:
         pass
     return state
 
@@ -299,30 +351,71 @@ def _upload_one(
     if not local_path.is_file():
         raise FileNotFoundError(local_path)
     remote_path = _safe_remote_directory(remote_path)
-    existing = _remote_metadata(remote_path, folder_id, runner=runner)
-    if existing is not None:
-        if _remote_matches_local(local_path, existing):
-            return "already_present"
-        raise FileExistsError(
-            f"Refusing to overwrite different Drive file: {remote_path}"
-        )
-    result = runner(
-        [
-            *_base_command(),
-            "copyto",
-            str(local_path),
-            _remote_spec(remote_path),
-            "--immutable",
-            *_folder_flags(folder_id),
-        ]
-    )
-    _raise_command_error("copyto", result)
-    verified = _remote_metadata(remote_path, folder_id, runner=runner)
-    if verified is None or not _remote_matches_local(local_path, verified):
-        raise RuntimeError(
-            f"Drive verification did not match local file: {remote_path}"
-        )
-    return "uploaded"
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            existing = _remote_metadata(
+                remote_path,
+                folder_id,
+                runner=runner,
+            )
+            if existing is not None:
+                if _remote_matches_local(local_path, existing):
+                    return "already_present"
+                raise FileExistsError(
+                    f"Refusing to overwrite different Drive file: {remote_path}"
+                )
+            result = runner(
+                [
+                    *_base_command(),
+                    "copyto",
+                    str(local_path),
+                    _remote_spec(remote_path),
+                    "--immutable",
+                    *_folder_flags(folder_id),
+                ]
+            )
+            _raise_command_error("copyto", result)
+            verified = _remote_metadata(
+                remote_path,
+                folder_id,
+                runner=runner,
+            )
+            if verified is None or not _remote_matches_local(
+                local_path,
+                verified,
+            ):
+                raise RuntimeError(
+                    "Drive verification did not match local file: "
+                    f"{remote_path}"
+                )
+            return "uploaded"
+        except FileExistsError:
+            raise
+        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            last_error = exc
+            message = str(exc).lower()
+            transient = any(
+                token in message
+                for token in (
+                    "timeout",
+                    "temporar",
+                    "rate limit",
+                    "429",
+                    "500",
+                    "502",
+                    "503",
+                    "504",
+                    "connection",
+                    "network",
+                )
+            )
+            if not transient or attempt == 3:
+                raise
+            time.sleep(2 ** (attempt - 1))
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Drive upload failed without an error")
 
 
 def test_drive_folder_access(
@@ -382,11 +475,11 @@ def _manifest_payload(
     instance_id: str,
     run: dict[str, Any],
     csv_path: Path,
-    excel_path: Path,
+    excel_path: Path | None,
     remote_directory: str,
     folder_id: str,
     csv_remote_path: str,
-    excel_remote_path: str,
+    excel_remote_path: str | None,
     manifest_remote_path: str,
     schedule: dict[str, Any],
     upload_timestamp: str,
@@ -415,14 +508,22 @@ def _manifest_payload(
         "run_status": run.get("status"),
         "sqlite_row_count": sqlite_rows,
         "csv_row_count": int(run.get("csv_rows_exported") or sqlite_rows),
-        "excel_row_count": int(run.get("excel_rows_exported") or sqlite_rows),
+        "excel_row_count": (
+            int(run.get("excel_rows_exported") or sqlite_rows)
+            if excel_path is not None
+            else None
+        ),
         "collection_started_at": run.get("started_at"),
         "collection_completed_at": run.get("completed_at"),
         "local_csv_path": str(csv_path.resolve()),
-        "local_excel_path": str(excel_path.resolve()),
+        "local_excel_path": (
+            str(excel_path.resolve()) if excel_path is not None else None
+        ),
         "upload_timestamp": upload_timestamp,
         "csv_sha256": sha256_file(csv_path),
-        "excel_sha256": sha256_file(excel_path),
+        "excel_sha256": (
+            sha256_file(excel_path) if excel_path is not None else None
+        ),
         "drive_folder_id": folder_id,
         "drive_remote_directory": remote_directory,
         "drive_csv_path": csv_remote_path,
@@ -437,7 +538,7 @@ def upload_run_bundle(
     *,
     data_dir: str | Path,
     csv_path: str | Path,
-    excel_path: str | Path,
+    excel_path: str | Path | None = None,
     folder_id: str | None = None,
     upload_csv: bool = True,
     upload_excel: bool = True,
@@ -450,10 +551,10 @@ def upload_run_bundle(
         raise ValueError("Drive folder does not match this instance")
     run_id = int(run["id"])
     csv_file = Path(csv_path).resolve()
-    excel_file = Path(excel_path).resolve()
+    excel_file = Path(excel_path).resolve() if excel_path else None
     prior = load_drive_state(data_dir, run_id)
     csv_checksum = sha256_file(csv_file)
-    excel_checksum = sha256_file(excel_file)
+    excel_checksum = sha256_file(excel_file) if excel_file else None
     if (
         prior.get("drive_upload_status") == "succeeded"
         and prior.get("drive_csv_checksum") == csv_checksum
@@ -471,7 +572,9 @@ def upload_run_bundle(
         f"{completed:%Y}/{completed:%m}/run_{run_id}_{timestamp}"
     )
     csv_remote = f"{remote_directory}/{csv_file.name}"
-    excel_remote = f"{remote_directory}/{excel_file.name}"
+    excel_remote = (
+        f"{remote_directory}/{excel_file.name}" if excel_file else None
+    )
     manifest_name = (
         f"ota_manifest_{instance_id}_run_{run_id}_{timestamp}.json"
     )
@@ -498,6 +601,12 @@ def upload_run_bundle(
         "drive_last_attempt_at": paris_now().isoformat(timespec="seconds"),
         "drive_csv_checksum": csv_checksum,
         "drive_excel_checksum": excel_checksum,
+        "local_csv_bytes": csv_file.stat().st_size,
+        "local_excel_bytes": (
+            excel_file.stat().st_size if excel_file else None
+        ),
+        "google_drive_remote_filename": csv_file.name,
+        "google_drive_remote_bytes": None,
         "csv_upload_status": (
             prior.get("csv_upload_status") or "pending"
             if upload_csv
@@ -512,7 +621,7 @@ def upload_run_bundle(
         or "pending",
         "manifest_created_at": manifest_created_at,
         "local_csv_path": str(csv_file),
-        "local_excel_path": str(excel_file),
+        "local_excel_path": str(excel_file) if excel_file else None,
     }
     _save_drive_state(data_dir, run_id, state)
     record_schedule_event(
@@ -530,15 +639,17 @@ def upload_run_bundle(
         runner=runner,
     )
     if configuration["status"] != "configured":
-        state["drive_upload_status"] = "not_configured"
+        # The verified local export remains durable and queued. Missing local
+        # authentication is an operational prerequisite, not a lost export.
+        state["drive_upload_status"] = "pending"
         state["drive_upload_error"] = configuration.get("error")
         _save_drive_state(data_dir, run_id, state)
         record_schedule_event(
             instance_id,
-            "drive_upload_failed",
+            "drive_upload_pending",
             data_dir=data_dir,
             run_id=run_id,
-            drive_upload_status="not_configured",
+            drive_upload_status="pending",
             error=state["drive_upload_error"],
         )
         return state
@@ -547,13 +658,29 @@ def upload_run_bundle(
     if upload_csv:
         try:
             _upload_one(csv_file, csv_remote, target, runner=runner)
+            csv_metadata = _remote_metadata(
+                csv_remote,
+                target,
+                runner=runner,
+            ) or {}
             state["csv_upload_status"] = "succeeded"
+            state["google_drive_remote_filename"] = csv_file.name
+            state["google_drive_remote_bytes"] = int(
+                csv_metadata.get("Size") or csv_file.stat().st_size
+            )
+            state["google_drive_remote_checksum"] = (
+                (csv_metadata.get("Hashes") or {}).get("MD5")
+                if isinstance(csv_metadata.get("Hashes"), dict)
+                else None
+            )
             successes += 1
         except Exception as exc:
             state["csv_upload_status"] = "failed"
             errors.append(f"CSV: {exc}")
     if upload_excel:
         try:
+            if excel_file is None:
+                raise FileNotFoundError("No successful local Excel export")
             _upload_one(excel_file, excel_remote, target, runner=runner)
             state["excel_upload_status"] = "succeeded"
             successes += 1
@@ -631,47 +758,62 @@ def retry_latest_failed_upload(
     runner: Runner = _run,
 ) -> dict[str, Any]:
     definition = get_scheduled_instance(instance_id)
-    resolved_dir = Path(data_dir or definition.data_dir)
-    states_dir = resolved_dir / "status" / "drive_uploads"
-    candidates: list[tuple[float, dict[str, Any]]] = []
-    for path in states_dir.glob("run_*.json"):
-        try:
-            state = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, TypeError):
-            continue
-        if state.get("drive_upload_status") not in {
-            "failed",
-            "partially_succeeded",
-            "pending",
-            "not_configured",
-        }:
-            continue
-        candidates.append((path.stat().st_mtime, state))
+    resolved_dirs = (
+        [Path(data_dir).resolve()]
+        if data_dir is not None
+        else drive_queue_data_dirs(instance_id)
+    )
+    candidates: list[tuple[float, Path, dict[str, Any]]] = []
+    for resolved_dir in resolved_dirs:
+        states_dir = resolved_dir / "status" / "drive_uploads"
+        for path in states_dir.glob("run_*.json"):
+            try:
+                state = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, TypeError):
+                continue
+            if state.get("drive_upload_status") not in {
+                "failed",
+                "partially_succeeded",
+                "pending",
+                "not_configured",
+            }:
+                continue
+            candidates.append((path.stat().st_mtime, resolved_dir, state))
     if not candidates:
         return {
             "drive_upload_status": "no_pending_upload",
             "instance_id": instance_id,
         }
-    state = sorted(candidates, key=lambda value: value[0], reverse=True)[0][1]
+    _, resolved_dir, state = sorted(
+        candidates,
+        key=lambda value: value[0],
+        reverse=True,
+    )[0]
     run_id = int(state["run_id"])
     from database import db
 
-    db.SQLITE_DB_PATH = resolved_dir / "hotel_price_collector.sqlite"
-    run = db.fetch_collection_run_by_id(run_id, backend="sqlite")
-    if run is None:
-        raise ValueError(f"Run {run_id} no longer exists")
-    return upload_run_bundle(
-        instance_id,
-        run,
-        data_dir=resolved_dir,
-        csv_path=state["local_csv_path"],
-        excel_path=state["local_excel_path"],
-        folder_id=state["drive_folder_id"],
-        upload_csv=state.get("csv_upload_status") != "disabled",
-        upload_excel=state.get("excel_upload_status") != "disabled",
-        retry=True,
-        runner=runner,
-    )
+    previous_database = db.SQLITE_DB_PATH
+    try:
+        db.SQLITE_DB_PATH = (
+            resolved_dir / "hotel_price_collector.sqlite"
+        )
+        run = db.fetch_collection_run_by_id(run_id, backend="sqlite")
+        if run is None:
+            raise ValueError(f"Run {run_id} no longer exists")
+        return upload_run_bundle(
+            instance_id,
+            run,
+            data_dir=resolved_dir,
+            csv_path=state["local_csv_path"],
+            excel_path=state["local_excel_path"],
+            folder_id=state["drive_folder_id"],
+            upload_csv=state.get("csv_upload_status") != "disabled",
+            upload_excel=state.get("excel_upload_status") != "disabled",
+            retry=True,
+            runner=runner,
+        )
+    finally:
+        db.SQLITE_DB_PATH = previous_database
 
 
 def pending_upload_states(
@@ -680,20 +822,28 @@ def pending_upload_states(
     data_dir: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     definition = get_scheduled_instance(instance_id)
-    root = Path(data_dir or definition.data_dir) / "status" / "drive_uploads"
     rows = []
-    for path in root.glob("run_*.json"):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, TypeError):
-            continue
-        if payload.get("drive_upload_status") in {
-            "pending",
-            "failed",
-            "partially_succeeded",
-            "not_configured",
-        }:
-            rows.append(payload)
+    roots = (
+        [Path(data_dir).resolve()]
+        if data_dir is not None
+        else drive_queue_data_dirs(instance_id)
+    )
+    for data_root in roots:
+        root = data_root / "status" / "drive_uploads"
+        for path in root.glob("run_*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, TypeError):
+                continue
+            if payload.get("drive_upload_status") in {
+                "pending",
+                "failed",
+                "partially_succeeded",
+                "not_configured",
+            }:
+                rows.append(
+                    {**payload, "queue_data_dir": str(data_root)}
+                )
     return sorted(
         rows,
         key=lambda value: str(value.get("drive_last_attempt_at") or ""),

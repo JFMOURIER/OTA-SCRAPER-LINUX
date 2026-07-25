@@ -58,6 +58,10 @@ from services.playwright_safe import (
     safe_screenshot,
     wait_for_owned_browser_exit,
 )
+from services.workspace_control import (
+    discover_cinnamon_session_environment,
+    move_browser_windows_to_workspace,
+)
 from services.scraper_errors import AccessRestrictionError, BrowserClosedError, PaginationUnsupportedError, is_browser_closed_error
 from services.resource_guard import ResourceLimitExceeded, resource_snapshot
 
@@ -555,6 +559,32 @@ class BookingPlaywrightCollector(BaseCollector):
         step(0.03, "browser launched")
 
         launch_args = ["--disable-dev-shm-usage", "--disable-background-networking"]
+        workspace_name = os.getenv("INSTANCE_WORKSPACE_NAME", "").strip()
+        window_class = os.getenv("INSTANCE_WINDOW_CLASS", "").strip()
+        if os.getenv("INSTANCE_ID", "").strip() in {
+            "near_30_days",
+            "instance_1",
+            "period_1",
+        }:
+            workspace_name = workspace_name or "SCRAPER 1"
+            window_class = window_class or "ota-scraper-instance-1"
+        workspace_session_env: dict[str, str] = {}
+        if not options.headless and workspace_name and window_class:
+            workspace_session_env = (
+                discover_cinnamon_session_environment()
+            )
+            if workspace_session_env:
+                # Playwright must launch on the active Cinnamon display before
+                # wmctrl can identify and move its native window.
+                os.environ.update(workspace_session_env)
+            else:
+                self.log(
+                    log_callback,
+                    "Workspace warning: active Cinnamon session environment "
+                    "could not be discovered; browser launch will use the "
+                    "existing process environment.",
+                )
+            launch_args.append(f"--class={window_class}")
         with sync_playwright() as playwright:
             browser_start = time.perf_counter()
             browser = None
@@ -590,11 +620,37 @@ class BookingPlaywrightCollector(BaseCollector):
             page = context.new_page()
             update_headless_startup(page_created="yes")
             results_page = page
+            workspace_result = move_browser_windows_to_workspace(
+                owner_pid=os.getpid(),
+                profile_dir=options.browser_profile_dir,
+                workspace_name=workspace_name,
+                window_class=window_class,
+                headless=options.headless,
+                session_env=workspace_session_env or None,
+                log=lambda message: self.log(log_callback, message),
+            )
+            options.stats.update(workspace_result)
+            self._notify_status(
+                options,
+                "Browser workspace placement checked.",
+                **workspace_result,
+            )
 
             def close_unexpected_page(new_page):
                 if new_page == results_page:
                     return
                 try:
+                    popup_workspace = move_browser_windows_to_workspace(
+                        owner_pid=os.getpid(),
+                        profile_dir=options.browser_profile_dir,
+                        workspace_name=workspace_name,
+                        window_class=window_class,
+                        headless=options.headless,
+                        poll_seconds=1.0,
+                        session_env=workspace_session_env or None,
+                        log=lambda message: self.log(log_callback, message),
+                    )
+                    options.stats.update(popup_workspace)
                     options.stats["unexpected_new_pages_closed"] = int(options.stats.get("unexpected_new_pages_closed", 0)) + 1
                     self.log(log_callback, "Unexpected new page opened and was closed.")
                     self._screenshot(new_page, screenshot_dir, "booking_unexpected_new_page", options, screenshot_paths, log_callback)

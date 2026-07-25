@@ -104,6 +104,11 @@ from services.resource_guard import (
 )
 from services.run_exports import automatic_export_run_csv
 from services.schedule_ui import render_automatic_schedule
+from services.stop_control import (
+    finalize_stopped_run,
+    request_instance_stop,
+)
+from services.operational_status import update_operational_status
 from services.status_reporting import build_status_fields
 from services.scraper_errors import (
     AccessRestrictionError,
@@ -1040,10 +1045,10 @@ def run_background_job_with_fatal_guard(
         runner(config, stop_event, queue)
     except ScraperAlreadyRunning as exc:
         if os.getenv("OTA_SCHEDULED_RUN") == "1":
-            put_log(queue, "scheduled_run_skipped_previous_run_active")
+            put_log(queue, "skipped_active_run")
             update_status_file(
-                status="scheduled_run_skipped_previous_run_active",
-                current_message="scheduled_run_skipped_previous_run_active",
+                status="skipped_active_run",
+                current_message="skipped_active_run",
                 last_error=None,
             )
         else:
@@ -1940,6 +1945,7 @@ def run_collection_job(config: CollectionConfig, stop_event: Event, queue: Queue
             }
             save_resume_checkpoint(config, checkpoint_payload)
         queue.put(("run_id", run_id))
+        update_status_file(current_run_id=run_id)
         if saved_count:
             queue.put(("records_saved", saved_count))
 
@@ -2728,6 +2734,7 @@ def run_resilient_collection_job(config: CollectionConfig, stop_event: Any, queu
             )
             save_checkpoint(checkpoint)
             log(f"New run created: {run_id}")
+        update_status_file(current_run_id=run_id)
         queue.put(("run_id", run_id))
         queue.put(("records_saved", saved_count))
         run_partial_dir = PARTIAL_DIR / "runs" / f"run_{int(run_id)}"
@@ -3697,22 +3704,35 @@ def drain_job_queue() -> None:
     if process.is_alive() and stop_requested_at is not None:
         elapsed = time.monotonic() - float(stop_requested_at)
         if elapsed >= WORKER_STOP_GRACE_SECONDS:
-            cleanup_owned_browser_processes(process.pid, lambda message: st.session_state.logs.append(message))
             process.terminate()
             process.join(timeout=3)
-            if process.is_alive():
-                process.kill()
-                process.join(timeout=2)
-            st.session_state.status = "stopped_by_user"
-            st.session_state.status_message = "Worker exceeded the stop grace period and was terminated with its scraper-owned browser descendants."
-            update_status_file(
-                status="stopped_by_user",
-                current_message=st.session_state.status_message,
-                forced_worker_termination=True,
-            )
+            if not process.is_alive():
+                finalize_stopped_run(
+                    INSTANCE_CONFIG.instance_id,
+                    data_dir=INSTANCE_CONFIG.data_dir,
+                )
+                st.session_state.status = "stopped_by_user"
+                st.session_state.status_message = (
+                    "Worker exceeded the cooperative stop grace period and "
+                    "exited after instance-scoped SIGTERM."
+                )
+                update_status_file(
+                    status="stopped_by_user",
+                    current_message=st.session_state.status_message,
+                    forced_worker_termination=True,
+                )
+            else:
+                st.session_state.status_message = (
+                    "Stop requested… waiting for the instance worker to exit."
+                )
     if not process.is_alive():
         process.join(timeout=0.2)
         exit_code = process.exitcode
+        if stop_requested_at is not None:
+            finalize_stopped_run(
+                INSTANCE_CONFIG.instance_id,
+                data_dir=INSTANCE_CONFIG.data_dir,
+            )
         if st.session_state.status in {"starting", "running", "stopping"}:
             if stop_requested_at is not None:
                 st.session_state.status = "stopped_by_user"
@@ -3731,6 +3751,16 @@ def drain_job_queue() -> None:
 
 def start_background_job(config: CollectionConfig) -> None:
     reset_current_results()
+    try:
+        update_operational_status(
+            INSTANCE_CONFIG.instance_id,
+            data_dir=INSTANCE_CONFIG.data_dir,
+            stop_requested=False,
+            stop_requested_at=None,
+            stop_source=None,
+        )
+    except (KeyError, ValueError):
+        pass
     if os.getenv("OTA_EXTERNAL_WORKER", "0").lower() in {"1", "true", "yes"}:
         # The system worker supervisor owns the scraper process. Streamlit only
         # submits an atomic request and then observes status files.
@@ -3881,16 +3911,23 @@ def render_job_status() -> None:
         csv_path = metrics.get("csv_file_path") or st.session_state.csv_file_path
         csv_error = metrics.get("csv_export_error") or st.session_state.csv_export_error
         if csv_status == "succeeded":
-            st.success("Final CSV export succeeded.")
+            st.success("Local export: succeeded")
             st.write(f"Final CSV path: {csv_path}")
+        elif csv_status in {"empty_export", "skipped_no_rows"}:
+            st.info("Local export: empty_export (the run has zero database rows).")
         elif csv_status == "failed":
-            st.warning("Final CSV export failed.")
+            st.warning("Local export: failed")
             if csv_error:
                 st.code(str(csv_error), language="text")
             if metrics.get("csv_export_traceback_file"):
                 st.write(f"CSV export traceback: {metrics.get('csv_export_traceback_file')}")
         else:
-            st.info("Final CSV export has not run for this session yet.")
+            st.info("Local export: not yet run")
+        drive_status = metrics.get("google_drive_upload_status") or metrics.get(
+            "drive_upload_status"
+        )
+        if drive_status:
+            st.write(f"Google Drive upload: {drive_status}")
     if metrics.get("latest_screenshot_path"):
         st.write(f"Latest screenshot path: {metrics.get('latest_screenshot_path')}")
     if metrics.get("last_error"):
@@ -4034,6 +4071,21 @@ def render_job_status() -> None:
         st.text("\n".join(st.session_state.logs[-400:]))
 
 
+def _request_stop_from_ui(source: str) -> dict[str, Any]:
+    """One backend used by both the top and scheduler-sidebar Stop buttons."""
+
+    result = request_instance_stop(
+        INSTANCE_CONFIG.instance_id,
+        data_dir=INSTANCE_CONFIG.data_dir,
+        source=source,
+        in_process_job=st.session_state.current_job,
+    )
+    st.session_state.status_message = "Stop requested…"
+    if result["active_worker"]:
+        st.session_state.status = "stopping"
+    return result
+
+
 def main() -> None:
     ensure_session_state()
     INSTANCE_CONFIG.ensure_directories()
@@ -4058,9 +4110,28 @@ def main() -> None:
     setup_diagnostics = build_setup_diagnostics() if db_backend == "postgres" else None
     drain_job_queue()
 
+    try:
+        update_operational_status(
+            INSTANCE_CONFIG.instance_id,
+            data_dir=INSTANCE_CONFIG.data_dir,
+        )
+    except (KeyError, ValueError):
+        # Non-scheduled development instances remain usable.
+        pass
     st.title("Hotel Price Collector")
+    if st.button(
+        "Stop scraper",
+        key=f"top_stop_{INSTANCE_CONFIG.instance_id}",
+        use_container_width=True,
+    ):
+        _request_stop_from_ui("top")
+        st.warning("Stop requested…")
     render_instance_info()
-    render_automatic_schedule(INSTANCE_CONFIG)
+    with st.sidebar:
+        render_automatic_schedule(
+            INSTANCE_CONFIG,
+            stop_callback=_request_stop_from_ui,
+        )
     render_instance_error_panel()
     with st.expander("Startup self check", expanded=False):
         st.json(startup_check)
@@ -4385,7 +4456,6 @@ def main() -> None:
         )
         start_clicked = st.button("Start collection", type="primary", use_container_width=True, disabled=not start_allowed or job_active)
         test_run_clicked = st.button("Start test run", use_container_width=True, disabled=not st.session_state.db_ready or job_active)
-        stop_clicked = st.button("Stop collection", use_container_width=True, disabled=not job_active)
         refresh_clicked = st.button("Manual refresh", use_container_width=True)
         export_clicked = st.button(
             "Export selected run to Excel",
@@ -4394,30 +4464,6 @@ def main() -> None:
         )
         merge_clicked = st.button("Merge instance exports", use_container_width=True, disabled=job_active)
         clear_clicked = st.button("Clear current dashboard results", use_container_width=True, disabled=job_active)
-
-    if stop_clicked and st.session_state.current_job:
-        if st.session_state.current_job.get("external"):
-            request_path = INSTANCE_CONFIG.status_dir / "worker_request.json"
-            atomic_write_json(
-                request_path,
-                {
-                    "request_id": str(uuid4()),
-                    "job_id": st.session_state.current_job.get("id"),
-                    "instance_id": INSTANCE_CONFIG.instance_id,
-                    "action": "stop",
-                    "timestamp": datetime.now().isoformat(),
-                },
-            )
-        else:
-            st.session_state.current_job["stop_event"].set("user")
-        st.session_state.current_job["stop_requested_at"] = time.monotonic()
-        st.session_state.status_message = "Stop requested. Saving the current checkpoint and closing the scraper browser."
-        st.session_state.status = "stopping"
-        update_status_file(
-            status="stopping",
-            current_message=st.session_state.status_message,
-            stop_requested_at=datetime.now().isoformat(sep=" ", timespec="seconds"),
-        )
 
     if refresh_clicked:
         st.rerun()

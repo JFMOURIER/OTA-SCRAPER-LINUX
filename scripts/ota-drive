@@ -3,6 +3,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RCLONE="${OTA_RCLONE_BIN:-$(command -v rclone || true)}"
+if [[ -z "$RCLONE" && -x "$HOME/.local/bin/rclone" ]]; then
+  RCLONE="$HOME/.local/bin/rclone"
+fi
 
 require_rclone() {
   if [[ -z "$RCLONE" ]]; then

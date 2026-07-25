@@ -257,7 +257,7 @@ def dispatch_instance(
     ) or _advisory_lock_busy(
         definition.data_dir / "status" / "scheduled_run.lock"
     ):
-        reason = "scheduled_run_skipped_previous_run_active"
+        reason = "skipped_active_run"
         _set_reason(definition, skip=reason)
         mark_slot_dispatched(
             definition.instance_id,
@@ -412,7 +412,7 @@ def request_run_once(
     ) or _advisory_lock_busy(
         resolved_dir / "status" / "scheduled_run.lock"
     ):
-        reason = "scheduled_run_skipped_previous_run_active"
+        reason = "skipped_active_run"
         record_schedule_event(
             instance_id,
             reason,

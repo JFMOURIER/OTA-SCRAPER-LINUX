@@ -169,10 +169,10 @@ class AutomaticWindowTests(unittest.TestCase):
         january = resolve_automatic_windows(date(2027, 1, 31))
         self.assertEqual(
             january["near_30_days"],
-            (date(2027, 1, 31), date(2027, 2, 27)),
+            (date(2027, 1, 31), date(2027, 3, 2)),
         )
         leap = resolve_automatic_windows(date(2024, 2, 29))
-        self.assertEqual(leap["near_30_days"][1], date(2024, 3, 28))
+        self.assertEqual(leap["near_30_days"][1], date(2024, 3, 30))
         self.assertLessEqual(
             leap["long_121_365_days"][1],
             date(2024, 2, 29) + timedelta(days=365),
@@ -252,8 +252,8 @@ class SchedulePersistenceAndValidationTests(unittest.TestCase):
     def test_frequency_ranges_and_duplicate_times(self):
         with tempfile.TemporaryDirectory() as directory:
             near = default_schedule("near_30_days")
-            for invalid in (14, 1441):
-                near["interval_minutes"] = invalid
+            for invalid in (0, 25):
+                near["runs_per_day"] = invalid
                 with self.assertRaises(ScheduleValidationError):
                     save_schedule(
                         "near_30_days",
@@ -315,17 +315,17 @@ class SchedulePersistenceAndValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             valid = default_schedule("near_30_days")
-            valid["interval_minutes"] = 30
+            valid["runs_per_day"] = 12
             save_schedule("near_30_days", valid, data_dir=root)
             invalid = dict(valid)
-            invalid["interval_minutes"] = 1
+            invalid["runs_per_day"] = 25
             with self.assertRaises(ScheduleValidationError):
                 save_schedule("near_30_days", invalid, data_dir=root)
             self.assertEqual(
                 load_schedule("near_30_days", data_dir=root)[
-                    "interval_minutes"
+                    "runs_per_day"
                 ],
-                30,
+                12,
             )
 
     def test_schedule_save_does_not_rewrite_systemd_timers(self):
@@ -429,7 +429,7 @@ class DispatcherTests(unittest.TestCase):
             )
             self.assertEqual(
                 state["last_skip_reason"],
-                "scheduled_run_skipped_previous_run_active",
+                "skipped_active_run",
             )
 
     def test_host_capacity_defers_one_pending_without_backlog(self):
@@ -484,7 +484,7 @@ class DispatcherTests(unittest.TestCase):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             self.assertEqual(
                 result["reason"],
-                "scheduled_run_skipped_previous_run_active",
+                "skipped_active_run",
             )
             deferred = request_run_once(
                 "near_30_days",
@@ -652,7 +652,7 @@ class ExportAndDriveTests(unittest.TestCase):
                 "SQLITE_DB_PATH",
                 database_path,
             ), patch(
-                "services.drive_delivery.upload_run_bundle",
+                "services.google_drive_sync.upload_run_bundle",
                 side_effect=verify_local_first,
             ) as upload:
                 automatic_export_run_bundle(

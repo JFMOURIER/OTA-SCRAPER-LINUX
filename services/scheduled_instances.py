@@ -7,7 +7,6 @@ from typing import Iterable
 
 from dateutil.relativedelta import relativedelta
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INSTANCE_ORDER = (
     "near_30_days",
@@ -27,6 +26,8 @@ class ScheduledInstanceDefinition:
     default_interval_minutes: int | None
     default_runs_per_day: int | None
     default_daily_run_times: tuple[str, ...]
+    workspace_name: str | None = None
+    window_class: str | None = None
     data_dir_override: Path | None = None
 
     @property
@@ -52,7 +53,7 @@ SCHEDULED_INSTANCES: dict[str, ScheduledInstanceDefinition] = {
     "near_30_days": ScheduledInstanceDefinition(
         instance_id="near_30_days",
         port=8501,
-        display=":101",
+        display="",
         drive_folder_id="18kkxujFodzEfoOmhfpBuZI8xDzaoUk8b",
         drive_folder_url=(
             "https://drive.google.com/drive/folders/"
@@ -60,8 +61,10 @@ SCHEDULED_INSTANCES: dict[str, ScheduledInstanceDefinition] = {
         ),
         default_frequency_mode="interval",
         default_interval_minutes=60,
-        default_runs_per_day=None,
+        default_runs_per_day=24,
         default_daily_run_times=(),
+        workspace_name="SCRAPER 1",
+        window_class="ota-scraper-instance-1",
     ),
     "medium_31_120_days": ScheduledInstanceDefinition(
         instance_id="medium_31_120_days",
@@ -107,29 +110,25 @@ def get_scheduled_instance(instance_id: str) -> ScheduledInstanceDefinition:
 
 
 def resolve_automatic_windows(anchor_date: date) -> dict[str, tuple[date, date]]:
-    """Resolve the single authoritative rolling one-year horizon.
+    """Resolve exact rolling stay-date offsets in Europe/Paris.
 
-    Calendar-month boundaries are used for all bucket boundaries.  The hard cap
-    is inclusive and guarantees that no generated stay date exceeds
-    ``anchor_date + 365 days``.
+    Scraper 1 is explicitly today through today + 30 calendar days.  The
+    The later instances retain their established calendar-month boundaries.
+    Scraper 2 starts immediately after scraper 1 so month-end anchors cannot
+    overlap the exact 31-date scraper-1 window.
     """
-
     near_start = anchor_date
-    medium_start = anchor_date + relativedelta(months=1)
+    near_end = anchor_date + timedelta(days=30)
+    medium_start = near_end + timedelta(days=1)
     long_start = anchor_date + relativedelta(months=4)
+    medium_end = long_start - timedelta(days=1)
     calendar_horizon_end = (
         anchor_date + relativedelta(months=12) - timedelta(days=1)
     )
     hard_cap_end = anchor_date + timedelta(days=365)
     windows = {
-        "near_30_days": (
-            near_start,
-            medium_start - timedelta(days=1),
-        ),
-        "medium_31_120_days": (
-            medium_start,
-            long_start - timedelta(days=1),
-        ),
+        "near_30_days": (near_start, near_end),
+        "medium_31_120_days": (medium_start, medium_end),
         "long_121_365_days": (
             long_start,
             min(calendar_horizon_end, hard_cap_end),

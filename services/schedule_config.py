@@ -46,6 +46,26 @@ class ScheduleValidationError(ValueError):
     pass
 
 
+def interval_seconds_for_runs_per_day(runs_per_day: int) -> float:
+    """Return the exact rolling-24-hour interval for 1..24 daily cycles."""
+
+    try:
+        runs = int(runs_per_day)
+    except (TypeError, ValueError) as exc:
+        raise ScheduleValidationError(
+            "runs_per_day must be an integer"
+        ) from exc
+    if isinstance(runs_per_day, float) and not runs_per_day.is_integer():
+        raise ScheduleValidationError("runs_per_day must be an integer")
+    if isinstance(runs_per_day, str) and str(runs) != runs_per_day.strip():
+        raise ScheduleValidationError("runs_per_day must be an integer")
+    if runs < 1 or runs > 24:
+        raise ScheduleValidationError(
+            "near_30_days supports 1–24 runs per day"
+        )
+    return 86_400.0 / runs
+
+
 def paris_now() -> datetime:
     return datetime.now(PARIS)
 
@@ -138,6 +158,13 @@ def default_schedule(
         "manual_over_one_year_confirmed": False,
         "frequency_mode": definition.default_frequency_mode,
         "interval_minutes": definition.default_interval_minutes,
+        "interval_seconds": (
+            interval_seconds_for_runs_per_day(
+                int(definition.default_runs_per_day)
+            )
+            if definition.instance_id == "near_30_days"
+            else None
+        ),
         "runs_per_day": definition.default_runs_per_day,
         "daily_run_times": list(definition.default_daily_run_times),
         "collection_template": default_collection_template(),
@@ -273,18 +300,34 @@ def validate_schedule(raw: Any) -> dict[str, Any]:
     if definition.instance_id == "near_30_days":
         if payload.get("frequency_mode") != "interval":
             raise ScheduleValidationError("Near schedule must use interval mode")
+        raw_runs = payload.get("runs_per_day")
+        if raw_runs is None:
+            # Backward-compatible migration for the prior interval-only file.
+            try:
+                legacy_minutes = float(payload.get("interval_minutes"))
+            except (TypeError, ValueError) as exc:
+                raise ScheduleValidationError(
+                    "Near runs_per_day is missing and the legacy interval is invalid"
+                ) from exc
+            if legacy_minutes < 60 or legacy_minutes > 1440:
+                raise ScheduleValidationError(
+                    "Legacy near interval must be between 60 and 1440 minutes"
+                )
+            raw_runs = round(1440.0 / legacy_minutes)
         try:
-            interval = int(payload.get("interval_minutes"))
+            runs = int(raw_runs)
         except (TypeError, ValueError) as exc:
             raise ScheduleValidationError(
-                "Near interval must be an integer"
+                "runs_per_day must be an integer"
             ) from exc
-        if interval < 15 or interval > 1440:
-            raise ScheduleValidationError(
-                "Near interval must be between 15 and 1440 minutes"
-            )
-        payload["interval_minutes"] = interval
-        payload["runs_per_day"] = None
+        if isinstance(raw_runs, float) and not raw_runs.is_integer():
+            raise ScheduleValidationError("runs_per_day must be an integer")
+        if isinstance(raw_runs, str) and str(runs) != raw_runs.strip():
+            raise ScheduleValidationError("runs_per_day must be an integer")
+        interval_seconds = interval_seconds_for_runs_per_day(runs)
+        payload["runs_per_day"] = runs
+        payload["interval_seconds"] = interval_seconds
+        payload["interval_minutes"] = interval_seconds / 60.0
         payload["daily_run_times"] = []
     else:
         if payload.get("frequency_mode") != "daily":
@@ -315,6 +358,7 @@ def validate_schedule(raw: Any) -> dict[str, Any]:
         payload["runs_per_day"] = runs
         payload["daily_run_times"] = times
         payload["interval_minutes"] = None
+        payload["interval_seconds"] = None
     payload["collection_template"] = _validate_collection_template(
         payload.get("collection_template")
     )
@@ -513,8 +557,10 @@ def read_schedule_history(
 def frequency_configuration(schedule: dict[str, Any]) -> dict[str, Any]:
     if schedule["frequency_mode"] == "interval":
         return {
-            "mode": "interval",
+            "mode": "rolling_24_hours",
+            "runs_per_day": schedule["runs_per_day"],
             "interval_minutes": schedule["interval_minutes"],
+            "interval_seconds": schedule["interval_seconds"],
         }
     return {
         "mode": "daily",
@@ -525,14 +571,17 @@ def frequency_configuration(schedule: dict[str, Any]) -> dict[str, Any]:
 
 def frequency_description(schedule: dict[str, Any]) -> str:
     if schedule["frequency_mode"] == "interval":
-        minutes = int(schedule["interval_minutes"])
-        hours, remainder = divmod(minutes, 60)
-        readable = []
-        if hours:
-            readable.append(f"{hours}h")
-        if remainder or not readable:
-            readable.append(f"{remainder}m")
-        return f"Every {minutes} minutes ({' '.join(readable)})"
+        seconds = float(schedule["interval_seconds"])
+        if seconds.is_integer() and int(seconds) % 3600 == 0:
+            interval = f"{int(seconds) // 3600} hour(s)"
+        elif seconds.is_integer() and int(seconds) % 60 == 0:
+            interval = f"{int(seconds) // 60} minute(s)"
+        else:
+            interval = f"{seconds:.3f} seconds"
+        return (
+            f"{schedule['runs_per_day']} run(s) per rolling 24 hours "
+            f"(every {interval})"
+        )
     return (
         f"{schedule['runs_per_day']} run(s) per day at "
         + ", ".join(schedule["daily_run_times"])
@@ -583,7 +632,7 @@ def current_due_slot(
         anchor = _parse_datetime(schedule["schedule_anchor_at"])
         if anchor is None or current < anchor:
             return None
-        interval = timedelta(minutes=int(schedule["interval_minutes"]))
+        interval = timedelta(seconds=float(schedule["interval_seconds"]))
         anchor_utc = anchor.astimezone(UTC)
         current_utc = current.astimezone(UTC)
         boundaries = int(
@@ -597,7 +646,7 @@ def current_due_slot(
             return None
         slot_key = (
             f"{schedule['instance_id']}:interval:"
-            f"{scheduled_for.isoformat(timespec='minutes')}"
+            f"{scheduled_for.isoformat(timespec='seconds')}"
         )
     else:
         candidates = [
@@ -643,7 +692,7 @@ def next_scheduled_run(
             return None
         if current < anchor:
             return anchor
-        interval = timedelta(minutes=int(schedule["interval_minutes"]))
+        interval = timedelta(seconds=float(schedule["interval_seconds"]))
         anchor_utc = anchor.astimezone(UTC)
         current_utc = current.astimezone(UTC)
         count = int(
@@ -682,7 +731,7 @@ def save_schedule(
     if bool(candidate.get("enabled")) and (
         not prior.get("enabled")
         or prior.get("frequency_mode") != candidate.get("frequency_mode")
-        or prior.get("interval_minutes") != candidate.get("interval_minutes")
+        or prior.get("runs_per_day") != candidate.get("runs_per_day")
         or prior.get("daily_run_times") != candidate.get("daily_run_times")
     ):
         candidate["schedule_anchor_at"] = _iso(

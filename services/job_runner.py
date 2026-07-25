@@ -356,7 +356,7 @@ def final_run_status(date_rows: list[dict[str, Any]], stopped: bool, fatal_error
     if fatal_error:
         return "fatal_error_with_partial_results"
     if stopped:
-        return "stopped_by_user_with_partial_results"
+        return "stopped_by_user"
     statuses = {str(row.get("status")) for row in date_rows}
     if "blocked_or_access_restricted" in statuses:
         return "completed_with_blocked_dates"

@@ -210,6 +210,8 @@ def run(instance_id: str, data_dir: Path) -> int:
             "INSTANCE_DATE_BUCKET": definition.date_bucket,
             "DB_BACKEND": "sqlite",
             "OTA_SCHEDULED_RUN": "1",
+            "INSTANCE_WORKSPACE_NAME": definition.workspace_name or "",
+            "INSTANCE_WINDOW_CLASS": definition.window_class or "",
         }
     )
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -230,14 +232,12 @@ def run(instance_id: str, data_dir: Path) -> int:
                 fcntl.LOCK_EX | fcntl.LOCK_NB,
             )
         except BlockingIOError:
-            _log(log_file, "scheduled_run_skipped_previous_run_active")
+            _log(log_file, "skipped_active_run")
             record_schedule_event(
                 instance_id,
-                "scheduled_run_skipped_previous_run_active",
+                "skipped_active_run",
                 data_dir=data_dir,
-                skip_or_defer_reason=(
-                    "scheduled_run_skipped_previous_run_active"
-                ),
+                skip_or_defer_reason="skipped_active_run",
             )
             return 0
         request = claim_launch_request(instance_id, data_dir=data_dir)
@@ -333,6 +333,15 @@ def run(instance_id: str, data_dir: Path) -> int:
             job_id,
         )
         stop_signal.reset()
+        from services.operational_status import update_operational_status
+
+        update_operational_status(
+            instance_id,
+            data_dir=data_dir,
+            stop_requested=False,
+            stop_requested_at=None,
+            stop_source=None,
+        )
         app.run_background_job_with_fatal_guard(
             app.run_resilient_collection_job,
             _build_config(app, request),

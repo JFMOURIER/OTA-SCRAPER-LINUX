@@ -48,6 +48,34 @@ COMPLETE_RUN_STATUSES = {
 }
 
 
+def _publish_local_export_status(
+    instance_id: str,
+    database_path: Path,
+    *,
+    status: str,
+    path: str | Path | None,
+    rows: int,
+) -> None:
+    try:
+        from services.operational_status import update_operational_status
+
+        resolved_path = Path(path).resolve() if path else None
+        update_operational_status(
+            instance_id,
+            data_dir=database_path.parent,
+            local_export_status=status,
+            local_export_path=str(resolved_path) if resolved_path else None,
+            local_export_rows=int(rows),
+            local_export_bytes=(
+                resolved_path.stat().st_size
+                if resolved_path and resolved_path.is_file()
+                else 0
+            ),
+        )
+    except Exception:
+        pass
+
+
 def _truthy_environment(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -188,6 +216,7 @@ def _successful_export_is_reusable(
     *,
     expected_rows: int,
     require_downloads: bool,
+    downloads_dir: Path | None = None,
 ) -> bool:
     if run.get("csv_export_status") != "succeeded":
         return False
@@ -200,7 +229,32 @@ def _successful_export_is_reusable(
         downloads_path = Path(str(run.get("csv_downloads_path") or ""))
         if not downloads_path.is_file():
             return False
+        if (
+            downloads_dir is not None
+            and downloads_path.parent.resolve() != downloads_dir.resolve()
+        ):
+            return False
     return True
+
+
+def _production_downloads_dir(instance_id: str) -> Path:
+    aliases = {
+        "near_30_days": "instance_1",
+        "period_1": "instance_1",
+        "instance_1": "instance_1",
+        "medium_31_120_days": "instance_2",
+        "period_2": "instance_2",
+        "instance_2": "instance_2",
+        "long_121_365_days": "instance_3",
+        "period_3": "instance_3",
+        "instance_3": "instance_3",
+    }
+    root = Path(os.getenv("OTA_DOWNLOADS_DIR", "/home/jf/Downloads"))
+    return (
+        root
+        / "OTA-SCRAPER-EXPORTS"
+        / aliases.get(instance_id, safe_filename(instance_id))
+    )
 
 
 def _next_available_paths(
@@ -246,9 +300,7 @@ def automatic_export_run_csv(
     if copy_to_downloads is None:
         copy_to_downloads = _copy_to_downloads_by_default(database_path)
     if downloads_dir is None and copy_to_downloads:
-        downloads_dir = Path(
-            os.getenv("OTA_DOWNLOADS_DIR", "/home/jf/Downloads")
-        )
+        downloads_dir = _production_downloads_dir(resolved_instance)
     resolved_downloads_dir = Path(downloads_dir) if downloads_dir else None
     lock_path = database_path.parent / "status" / f"csv_export_run_{run_id}.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -280,18 +332,27 @@ def automatic_export_run_csv(
             run,
             expected_rows=expected_rows,
             require_downloads=bool(copy_to_downloads),
+            downloads_dir=resolved_downloads_dir,
         ):
             if log:
                 log(
                     f"Reusing successful automatic CSV export for run {run_id}: "
                     f"{run.get('csv_file_path')}"
                 )
-            return _payload(run)
+            payload = _payload(run)
+            _publish_local_export_status(
+                resolved_instance,
+                database_path,
+                status="succeeded",
+                path=payload.get("csv_file_path"),
+                rows=expected_rows,
+            )
+            return payload
 
         if expected_rows == 0:
             db.update_collection_run_csv_export(
                 run_id,
-                status="skipped_no_rows",
+                status="empty_export",
                 csv_file_path=None,
                 csv_downloads_path=None,
                 rows_exported=0,
@@ -299,9 +360,17 @@ def automatic_export_run_csv(
                 error=None,
                 backend="sqlite",
             )
-            return _payload(
+            payload = _payload(
                 db.fetch_collection_run_by_id(run_id, backend="sqlite") or {}
             )
+            _publish_local_export_status(
+                resolved_instance,
+                database_path,
+                status="empty_export",
+                path=None,
+                rows=0,
+            )
+            return payload
 
         prior_instance_path = Path(str(run.get("csv_file_path") or ""))
         can_reuse_prior = (
@@ -384,6 +453,13 @@ def automatic_export_run_csv(
                     f"Automatic run {run_id} CSV exported atomically with "
                     f"{expected_rows} rows: {instance_path}"
                 )
+            _publish_local_export_status(
+                resolved_instance,
+                database_path,
+                status="succeeded",
+                path=instance_path,
+                rows=expected_rows,
+            )
         except Exception as exc:
             db.update_collection_run_csv_export(
                 run_id,
@@ -401,6 +477,13 @@ def automatic_export_run_csv(
             )
             if log:
                 log(f"Automatic run {run_id} CSV export failed: {exc}")
+            _publish_local_export_status(
+                resolved_instance,
+                database_path,
+                status="failed",
+                path=instance_path if instance_path.exists() else None,
+                rows=expected_rows,
+            )
         return _payload(
             db.fetch_collection_run_by_id(run_id, backend="sqlite") or {}
         )
@@ -422,9 +505,7 @@ def automatic_export_run_excel(
     if copy_to_downloads is None:
         copy_to_downloads = _copy_to_downloads_by_default(database_path)
     if downloads_dir is None and copy_to_downloads:
-        downloads_dir = Path(
-            os.getenv("OTA_DOWNLOADS_DIR", "/home/jf/Downloads")
-        )
+        downloads_dir = _production_downloads_dir(resolved_instance)
     resolved_downloads_dir = Path(downloads_dir) if downloads_dir else None
     lock_path = (
         database_path.parent / "status" / f"excel_export_run_{run_id}.lock"
@@ -650,10 +731,7 @@ def automatic_export_run_bundle(
         run["authoritative_row_count"] = expected_rows
         local_success = (
             csv_payload.get("csv_export_status") == "succeeded"
-            and excel_payload.get("excel_export_status") == "succeeded"
             and int(csv_payload.get("csv_rows_exported") or -1)
-            == expected_rows
-            and int(excel_payload.get("excel_rows_exported") or -1)
             == expected_rows
         )
         try:
@@ -680,14 +758,19 @@ def automatic_export_run_bundle(
                 ),
             )
             if local_success and schedule["drive_upload_enabled"]:
-                from services.drive_delivery import upload_run_bundle
+                from services.google_drive_sync import upload_run_bundle
 
                 drive = upload_run_bundle(
                     resolved_instance,
                     run,
                     data_dir=database_path.parent,
                     csv_path=str(csv_payload["csv_file_path"]),
-                    excel_path=str(excel_payload["excel_file_path"]),
+                    excel_path=(
+                        str(excel_payload["excel_file_path"])
+                        if excel_payload.get("excel_export_status")
+                        == "succeeded"
+                        else None
+                    ),
                     folder_id=schedule["drive_folder_id"],
                     upload_csv=schedule["upload_csv"],
                     upload_excel=schedule["upload_excel"],

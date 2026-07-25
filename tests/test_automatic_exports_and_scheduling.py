@@ -388,7 +388,7 @@ class IsolationAndSchedulingTests(unittest.TestCase):
             root / "tools" / "ota_scheduled_run.py"
         ).read_text(encoding="utf-8")
         self.assertIn(
-            "scheduled_run_skipped_previous_run_active",
+            "skipped_active_run",
             scheduled_runner,
         )
         for name in ("near", "medium", "long"):
